@@ -34,16 +34,16 @@ class TractorEnv():
             self.major = random.sample(self.suit_set, 1)[0]
         else:
             self.major = major
-        # if self.banker_pos: # banker predetermined, cannot be first_round
-        #     self.first_round = False
+        if self.banker_pos: # banker predetermined, cannot be first_round
+            self.first_round = False
         # initializing reporters and snathcers
-        # self.reporter = None
-        # self.snatcher = None
+        self.reporter = None
+        self.snatcher = None
         # initializing decks
         self.total_deck = [i for i in range(108)] 
         random.shuffle(self.total_deck)
-        # self.public_card = self.total_deck[100:] # saving 8 public cards
-        self.covered_card = self.total_deck[100:]
+        self.public_card = self.total_deck[100:] # saving 8 public cards
+        # self.covered_card = self.total_deck[100:]
         self.card_todeal = self.total_deck[:100]
         self.player_decks = [[] for _ in range(4)]
         self.player_decks[0] = self.card_todeal[:25]
@@ -53,7 +53,7 @@ class TractorEnv():
         self._setMajor()
         self.mv_gen = move_generator(self.level, self.major)
         # assuming that covered_cards are publiccards
-        # self.covered_cards = [] 
+        self.covered_cards = [] 
         # loading and initializing agents and game states
         self.score = 0
         self.history = []
@@ -72,38 +72,38 @@ class TractorEnv():
         self.reward = None
         curr_player = response['player']
         action = response['action']
-        # if self.round <= 100: # dealing stage
-        #     if len(action) != 0: # make report/snatch
-        #         if len(action) == 1:
-        #             if self.reporter: # Already reported
-        #                 self._raise_error(curr_player, "ALREADY_REPORTED")
-        #             repo_card = action[0]
-        #             repo_name = self._id2name(repo_card)
-        #             if repo_name[1] != self.level:
-        #                 self._raise_error(curr_player, "INVALID_MOVE")
-        #             self._report(action, curr_player)
-        #         elif len(action) == 2:
-        #             if not self.reporter: # Haven't reported yet
-        #                 self._raise_error(curr_player, "CANNOT_SNATCH")
-        #             if self.snatcher:
-        #                 self._raise_error(curr_player, "ALREADY_SNATCHED")
-        #             snatch_card = action[0]
-        #             snatch_name = self._id2name(snatch_card)
-        #             if (action[1] - action[0]) % 54 != 0: # not a pair
-        #                 self._raise_error(curr_player, "INVALID_MOVE")
-        #             if snatch_name[1] != self.level:
-        #                 self._raise_error(curr_player, "INVALID_MOVE")
-        #             self._snatch(action, curr_player)
-        #         else: # other lengths. INVALID_MOVE
-        #             self._raise_error(curr_player, "INVALID_MOVE")
-        #     if self.round == 100:
-        #         if not self.reporter: # not reported
-        #             self.random_pick_major()
-        #         self._deliver_public()
-        #         next_player = self.banker_pos
-        #     else:
-        #         new_deliver = self._deal()
-        #         next_player = (curr_player + 1) % 4
+        if self.round <= 100: # dealing stage
+            if len(action) != 0: # make report/snatch
+                if len(action) == 1:
+                    if self.reporter: # Already reported
+                        self._raise_error(curr_player, "ALREADY_REPORTED")
+                    repo_card = action[0]
+                    repo_name = self._id2name(repo_card)
+                    if repo_name[1] != self.level:
+                        self._raise_error(curr_player, "INVALID_MOVE")
+                    self._report(action, curr_player)
+                elif len(action) == 2:
+                    if not self.reporter: # Haven't reported yet
+                        self._raise_error(curr_player, "CANNOT_SNATCH")
+                    if self.snatcher:
+                        self._raise_error(curr_player, "ALREADY_SNATCHED")
+                    snatch_card = action[0]
+                    snatch_name = self._id2name(snatch_card)
+                    if (action[1] - action[0]) % 54 != 0: # not a pair
+                        self._raise_error(curr_player, "INVALID_MOVE")
+                    if snatch_name[1] != self.level:
+                        self._raise_error(curr_player, "INVALID_MOVE")
+                    self._snatch(action, curr_player)
+                else: # other lengths. INVALID_MOVE
+                    self._raise_error(curr_player, "INVALID_MOVE")
+            if self.round == 100:
+                if not self.reporter: # not reported
+                    self.random_pick_major()
+                self._deliver_public()
+                next_player = self.banker_pos
+            else:
+                new_deliver = self._deal()
+                next_player = (curr_player + 1) % 4
         real_action = self._checkLegalMove(action, curr_player)
         real_action = self._name2id_seq(real_action, self.player_decks[curr_player])
         self._play(curr_player, real_action)
@@ -198,40 +198,40 @@ class TractorEnv():
         self.history.append(cards)
         
         
-    # def _deal(self):
-    #     target_player = self.round % 4
-    #     deal_card = self.card_todeal[0]
-    #     self.player_decks[target_player].append(deal_card)
-    #     self.card_todeal.remove(deal_card)
-    #     return deal_card
+    def _deal(self):
+        target_player = self.round % 4
+        deal_card = self.card_todeal[0]
+        self.player_decks[target_player].append(deal_card)
+        self.card_todeal.remove(deal_card)
+        return deal_card
     
-    # def _report(self, repo_card: list, reporter): # can't be 'jo' or 'Jo' when reporting
-    #     repo_name = self._id2name(repo_card[0])
-    #     major_suit = repo_name[0]
-    #     self.major = major_suit
-    #     self.reporter = reporter
+    def _report(self, repo_card: list, reporter): # can't be 'jo' or 'Jo' when reporting
+        repo_name = self._id2name(repo_card[0])
+        major_suit = repo_name[0]
+        self.major = major_suit
+        self.reporter = reporter
     
-    # def _snatch(self, snatch_card: list, snatcher):
-    #     snatch_name = self._id2name(snatch_card[0])
-    #     if snatch_name[1] == 'o': # Using joker to snatch, non-major
-    #         self.major = 'n'
-    #     else:
-    #         self.major = snatch_name[0]
-    #     self.snatcher = snatcher
+    def _snatch(self, snatch_card: list, snatcher):
+        snatch_name = self._id2name(snatch_card[0])
+        if snatch_name[1] == 'o': # Using joker to snatch, non-major
+            self.major = 'n'
+        else:
+            self.major = snatch_name[0]
+        self.snatcher = snatcher
         
-    # def random_pick_major(self): # a major is picked randomly if there's no reporter in the dealing stage
-    #     if self.first_round: # The banker needs determining with the major in the first round
-    #         self.banker_pos = random.choice(range(4))
-    #     self.major = random.choice(self.suit_set)
+    def random_pick_major(self): # a major is picked randomly if there's no reporter in the dealing stage
+        if self.first_round: # The banker needs determining with the major in the first round
+            self.banker_pos = random.choice(range(4))
+        self.major = random.choice(self.suit_set)
     
-    # def _deliver_public(self): # delivering public card to banker
-    #     for card in self.public_card:
-    #         self.player_decks[self.banker_pos].append(card)
+    def _deliver_public(self): # delivering public card to banker
+        for card in self.public_card:
+            self.player_decks[self.banker_pos].append(card)
     
-    # def _cover(self, cover_card): # Doing no sanity check here
-    #     for card in cover_card:
-    #         self.covered_cards.append(card)
-    #         self.player_decks[self.banker_pos].remove(card)
+    def _cover(self, cover_card): # Doing no sanity check here
+        for card in cover_card:
+            self.covered_cards.append(card)
+            self.player_decks[self.banker_pos].remove(card)
             
     def _reveal(self, currplayer, winner): # 扣底
         if self._checkPokerType(self.history[0], (currplayer-3)%4) != "suspect":
