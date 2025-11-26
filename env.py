@@ -47,6 +47,7 @@ class TractorEnv():
             self.major = random.sample(self.suit_set, 1)[0]
         else:
             self.major = major
+        self._setMajor()
 
         # report / snatch 状态
         self.reporter = None
@@ -275,6 +276,7 @@ class TractorEnv():
             if snatch_name[1] != self.level:
                 self._raise_error(snatcher, "INVALID_MOVE")
             self.major = snatch_name[0]
+        self._setMajor()
 
         self.snatcher = snatcher
 
@@ -282,7 +284,9 @@ class TractorEnv():
         """发牌阶段没人报主时，随机选庄和主。"""
         if self.first_round:
             self.banker_pos = random.choice(range(4))
-        self.major = random.choice(self.suit_set)
+        if not self.major:
+            self.major = random.choice(self.suit_set)
+        self._setMajor()
 
     def _deliver_public(self):
         """将原始底牌发给庄家（真正的底牌之后由庄家从手牌中选出）。"""
