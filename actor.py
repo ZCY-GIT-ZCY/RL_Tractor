@@ -49,7 +49,8 @@ class Actor(Process):
             episode_data = {agent_name: {
                 'state' : {
                     'observation': [],
-                    'action_mask': []
+                    'action_mask': [],
+                    'stage': [] # Add stage storage
                 },
                 'action' : [],
                 'reward' : [],
@@ -61,11 +62,18 @@ class Actor(Process):
                 player = obs['id']
                 agent_name = env.agent_names[player]
                 agent_data = episode_data[agent_name]
-                obs_mat, action_mask = self.wrapper.obsWrap(obs, action_options)
+                
+                # Wrapper now returns stage
+                obs_mat, action_mask, stage_val = self.wrapper.obsWrap(obs, action_options)
+                
                 agent_data['state']['observation'].append(obs_mat)
                 agent_data['state']['action_mask'].append(action_mask)
+                agent_data['state']['stage'].append(stage_val)
+                
                 state['observation'] = torch.tensor(obs_mat, dtype = torch.float).unsqueeze(0)
                 state['action_mask'] = torch.tensor(action_mask, dtype = torch.float).unsqueeze(0)
+                state['stage'] = torch.tensor(stage_val, dtype = torch.long).unsqueeze(0) # Add stage to input
+                
                 model.train(False) # Batch Norm inference mode
                 with torch.no_grad():
                     logits, value = model(state)
@@ -75,28 +83,42 @@ class Actor(Process):
                     
                 agent_data['action'].append(action)
                 agent_data['value'].append(value)
+                agent_data['reward'].append(0) # Initialize reward for this step
+                
                 # interpreting actions
-                action_cards = action_options[action]
-                response = env.action_intpt(action_cards, player)
+                # Pass index directly as per new Env interface
+                response = {'player': player, 'action': action}
+                
                 # interact with env
                 next_obs, action_options, rewards, done = env.step(response)
                 if rewards:
                     # rewards are added per four moves (1 move for each player) on all four players
                     for agent_name in rewards: 
-                        episode_data[agent_name]['reward'].append(rewards[agent_name])
+                        # Add to the last reward entry (credit assignment)
+                        if len(episode_data[agent_name]['reward']) > 0:
+                            episode_data[agent_name]['reward'][-1] += rewards[agent_name]
                 obs = next_obs
             print(self.name, 'Episode', episode, 'Model', latest['id'], 'Reward', rewards)
             
             # postprocessing episode data for each agent
             for agent_name, agent_data in episode_data.items():
-                if len(agent_data['action']) < len(agent_data['reward']):
-                    agent_data['reward'].pop(0)
-                obs = np.stack(agent_data['state']['observation'])
-                mask = np.stack(agent_data['state']['action_mask'])
-                actions = np.array(agent_data['action'], dtype = np.int64)
-                rewards = np.array(agent_data['reward'], dtype = np.float32)
-                values = np.array(agent_data['value'], dtype = np.float32)
-                next_values = np.array(agent_data['value'][1:] + [0], dtype = np.float32)
+                # Ensure alignment (though logic above should keep them aligned)
+                length = min(len(agent_data['action']), len(agent_data['reward']))
+                
+                obs = np.stack(agent_data['state']['observation'][:length])
+                mask = np.stack(agent_data['state']['action_mask'][:length])
+                stage = np.array(agent_data['state']['stage'][:length], dtype=np.int64) 
+                
+                actions = np.array(agent_data['action'][:length], dtype = np.int64)
+                rewards = np.array(agent_data['reward'][:length], dtype = np.float32)
+                values = np.array(agent_data['value'][:length], dtype = np.float32)
+                # Next value estimation
+                # If done, next value is 0. If truncated, use bootstrap? Assuming done at episode end.
+                next_values = np.array(agent_data['value'][1:length+1] + [0], dtype = np.float32)
+                # Note: agent_data['value'] might be longer by 1 if we appended? No, 1-to-1.
+                # Actually next_values should be shifted. 
+                # value[t+1] corresponds to reward[t] + gamma * value[t+1].
+                # If length is N, values has N. values[1:] has N-1. + [0] makes N. Correct.
                 
                 td_target = rewards + next_values * self.config['gamma']
                 td_delta = td_target - values
@@ -112,11 +134,10 @@ class Actor(Process):
                 self.replay_buffer.push({
                     'state': {
                         'observation': obs,
-                        'action_mask': mask
+                        'action_mask': mask,
+                        'stage': stage # Push stage
                     },
                     'action': actions,
                     'adv': advantages,
                     'target': td_target
                 })
-        
-        

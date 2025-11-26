@@ -10,7 +10,13 @@ class ModelPoolServer:
         self.model_list = [None] * capacity
         # shared_model_list: N metadata {id, _addr} + n
         metadata_size = 1024
-        self.shared_model_list = ShareableList([' ' * metadata_size] * capacity + [self.n], name = name)
+        try:
+            self.shared_model_list = ShareableList([' ' * metadata_size] * capacity + [self.n], name = name)
+        except FileExistsError:
+            print(f"Shared memory {name} exists, cleaning up...")
+            old_sl = ShareableList(name=name)
+            old_sl.shm.unlink()
+            self.shared_model_list = ShareableList([' ' * metadata_size] * capacity + [self.n], name = name)
         
     def push(self, state_dict, metadata = {}):
         n = self.n % self.capacity
@@ -20,7 +26,7 @@ class ModelPoolServer:
         
         data = cPickle.dumps(state_dict) # model parameters serialized to bytes
         memory = SharedMemory(create = True, size = len(data))
-        memory.buf[:] = data[:]
+        memory.buf[:len(data)] = data[:]
         # print('Created model', self.n, 'in shared memory', memory.name)
         
         metadata = metadata.copy()
@@ -64,9 +70,17 @@ class ModelPoolClient:
     
     def get_latest_model(self):
         self._update_model_list()
+        start_time = time.time()
         while self.n == 0:
+            if time.time() - start_time > 10:  # Timeout after 10 seconds
+                print("ModelPoolClient: Timeout waiting for initial model")
+                break
             time.sleep(0.1)
             self._update_model_list()
+        
+        if self.n == 0:
+             return None # Handle None return in caller
+
         return self.model_list[(self.n + self.capacity - 1) % self.capacity]
         
     def load_model(self, metadata):

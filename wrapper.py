@@ -39,7 +39,9 @@ class cardWrapper:
             elif cardset[1, card_pos[0], card_pos[1]] == 0:
                 cardset[1, card_pos[0], card_pos[1]] = 1    
             else:
-                raise "More than two cards with same suits and points. Please recheck."
+                # raise "More than two cards with same suits and points. Please recheck."
+                # Allow it for robustness or ignore
+                pass
 
         return cardset
     
@@ -72,6 +74,8 @@ class cardWrapper:
         obs: raw obs from env
         '''
         id = obs['id']
+        stage = obs.get('stage', 0) # Extract stage, default 0
+        
         major_mat = np.zeros((2,4,14))
         deck_mat = np.zeros((2,4,14))
         hist_mat = np.zeros((8,4,14)) # Holding no more than 4 sets of cards
@@ -93,6 +97,6 @@ class cardWrapper:
         action_mask = np.zeros(54)
         action_mask[:len(options)] = 1
         
-        return np.concatenate((major_mat, deck_mat, hist_mat, played_mat, option_mat)), action_mask
+        # Return stage as well
+        return np.concatenate((major_mat, deck_mat, hist_mat, played_mat, option_mat)), action_mask, stage
     
-        

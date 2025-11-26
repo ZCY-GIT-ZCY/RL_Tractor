@@ -1,0 +1,10 @@
+__pycache__
+**/*.pt
+*.png
+slurm_logs
+exps
+eval
+.pdf
+.sh
+shengji_plus
+.DS_Store
