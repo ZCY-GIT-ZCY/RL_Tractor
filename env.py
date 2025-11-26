@@ -28,185 +28,366 @@ class TractorEnv():
         self.agent_names = ['player_%d' % i for i in range(4)]
         self.mode = None
         self.stage = self.STAGE_SNATCH
-        
     def reset(self, level='2', banker_pos=0, major='s'):
+        """
+        Reset the environment.
+
+        - 不再一次性发完 25 张牌。
+        - 进入 STAGE_SNATCH：每发一张牌，就让拿到牌的玩家立刻有一次报主 / 反主 / 不报 的决策机会。
+        """
+        # basic game parameters
         self.point_order = ['2', '3', '4', '5', '6', '7', '8', '9', '0', 'J', 'Q', 'K', 'A']
         self.Major = ['jo', 'Jo']
         self.level = level
-        self.first_round = True 
+        self.first_round = True
         self.banker_pos = banker_pos
-        self.curr_player = banker_pos # Start dealing/snatching from banker or random?
-        
-        # Determine Major if fixed, else random or wait for snatch
-        if major == 'r': 
-            self.major = 'n' # Placeholder until snatched
+
+        # 初始主花色（之后可以被报主 / 反主覆盖）
+        if major == 'r':
+            self.major = random.sample(self.suit_set, 1)[0]
         else:
             self.major = major
 
-        if self.banker_pos:
-            self.first_round = False
-
+        # report / snatch 状态
         self.reporter = None
         self.snatcher = None
-        self.snatch_passes = 0
-        
-        # Initialize decks
-        self.total_deck = [i for i in range(108)] 
+
+        # 初始化整副牌，并拆分为：前 100 张用于发牌，后 8 张为底牌
+        self.total_deck = list(range(108))
         random.shuffle(self.total_deck)
-        self.public_card = self.total_deck[100:] 
-        self.covered_cards = [] 
-        
-        # Deal all cards immediately for the staged approach
+        self.card_todeal = self.total_deck[:100]   # 顺序发出的 100 张牌
+        self.card_public = self.total_deck[100:]   # 原始底牌 8 张
+
+        # 四家起始手牌为空，之后通过 _deal_one 逐步发牌
         self.player_decks = [[] for _ in range(4)]
-        for i in range(100):
-            card = self.total_deck[i]
-            target = i % 4
-            self.player_decks[target].append(card)
-            
-        self._setMajor() # Preliminary major set (might change during snatch)
-        self.mv_gen = move_generator(self.level, self.major)
-        
+
+        # 扣底后的底牌；开始为空，STAGE_BURY 时从庄家手中选出
+        self.covered_card = []
+
+        # game state
         self.score = 0
         self.history = []
         self.played_cards = [[] for _ in range(4)]
         self.reward = None
         self.done = False
-        self.round = 0 
-        
-        # Start at Snatch Stage
-        self.stage = self.STAGE_SNATCH
-        self.curr_player = random.randint(0, 3) # Random start for snatching
-        
-        return self._get_obs(self.curr_player), self._get_action_options(self.curr_player)
 
-    def step(self, response): 
-        # response: dict{'player': player_id, 'action': action_index} (Note: Input is index now, converted to cards internally if needed)
+        # 发牌 / 阶段状态
+        self.stage = self.STAGE_SNATCH
+        self.deal_index = 0          # 已经发出的牌数（0..100）
+        self.bury_left = len(self.card_public)  # 庄家需要扣的牌数（等于原始底牌数）
+        self.round = 0               # 正常出牌阶段的轮次计数（只在 PLAY 用）
+
+        # 首张牌：发给 player 0（如果你想对齐线上规则，也可以改成 banker_pos）
+        self.curr_player = self.banker_pos
+        self._deal_one(self.curr_player)
+
+        obs = self._get_obs(self.curr_player)
+        action_options = self._get_action_options(self.curr_player)
+        return obs, action_options
+
+    def _deal_one(self, player: int):
+        """给指定玩家发一张牌。"""
+        if self.deal_index >= len(self.card_todeal):
+            return None
+        card = self.card_todeal[self.deal_index]
+        self.deal_index += 1
+        self.player_decks[player].append(card)
+        return card
+
+    def step(self, response):
+        """
+        response: dict{'player': int, 'action': int}
+        这里的 `action` 是当前 action_options 的索引。
+        """
         self.reward = None
         curr_player = response['player']
-        action_idx = response['action'] # This is an INT index now
-        
-        # Get options to interpret action
-        options = self._get_action_options_internal(curr_player) # Need internal method to avoid recursion/state change
-        action_cards = options[action_idx]
-        
+        action_idx = response['action']
+
+        # ---------- STAGE 0: 发牌 + 报主 / 反主 ----------
         if self.stage == self.STAGE_SNATCH:
-            if len(action_cards) == 0: # Pass
-                self.snatch_passes += 1
-                if self.snatch_passes >= 3 and self.reporter is not None:
-                     # End snatching
-                     self._end_snatch()
-                elif self.snatch_passes >= 4 and self.reporter is None:
-                     # Force end - Random major
-                     self.random_pick_major()
-                     self._end_snatch()
+            assert curr_player == self.curr_player
+
+            options = self._get_action_options(curr_player)
+            if not options:
+                options = [[]]  # 至少要有个“pass”
+            if action_idx < 0 or action_idx >= len(options):
+                raise Error(f"Invalid action index {action_idx} for player {curr_player} in SNATCH stage")
+
+            # options 里每个元素是一个牌名列表；空列表 [] 表示“什么都不报”
+            chosen_names = options[action_idx]
+
+            # 非空则进行报主 / 反主
+            if len(chosen_names) > 0:
+                chosen_ids = self._name2id_seq(chosen_names, self.player_decks[curr_player])
+                if len(chosen_ids) == 1:
+                    # 报主
+                    self._report(chosen_ids, curr_player)
+                elif len(chosen_ids) == 2:
+                    # 反主
+                    self._snatch(chosen_ids, curr_player)
                 else:
-                    self.curr_player = (curr_player + 1) % 4
-            else: # Snatch/Report
-                self.snatch_passes = 0
-                if len(action_cards) == 1:
-                    self._report(action_cards, curr_player)
-                elif len(action_cards) == 2:
-                    self._snatch(action_cards, curr_player)
-                # If someone snatches, continue bidding until stabilized
-                self.curr_player = (curr_player + 1) % 4
-                
-        elif self.stage == self.STAGE_BURY:
-             if curr_player != self.banker_pos:
-                 self._raise_error(curr_player, "NOT_BANKER_IN_BURY")
-             
-             # Action is a single card to bury
-             # Convert name to ID
-             bury_cards_id = self._name2id_seq(action_cards, self.player_decks[curr_player])
-             card_to_bury_id = bury_cards_id[0]
-             
-             self.player_decks[curr_player].remove(card_to_bury_id)
-             self.covered_cards.append(card_to_bury_id)
-             
-             if len(self.covered_cards) == 8:
-                 self.stage = self.STAGE_PLAY
-                 self.curr_player = self.banker_pos
-                 self.round = 1
-                 self.history = []
-             else:
-                 # Continue burying
-                 self.curr_player = self.banker_pos
-                 
-        elif self.stage == self.STAGE_PLAY:
-            self.mode = "play"
-            # Logic from original step
-            real_action = self._name2id_seq(action_cards, self.player_decks[curr_player])
-            # Check legal move (re-verify in case)
-            # real_action = self._checkLegalMove(real_action, curr_player) # Assumed legal from options
-            self._play(curr_player, real_action)
-            self.curr_player = (curr_player + 1) % 4
-            
-            if len(self.history) == 4: # finishing a round
+                    self._raise_error(curr_player, "INVALID_SNATCH_ACTION")
+
+            # 之后要么继续发牌，要么发牌阶段结束
+            if self.deal_index < len(self.card_todeal):
+                # 还有牌可以发 -> 发给下家，然后轮到下家报主/反主/不报
+                next_player = (curr_player + 1) % 4
+                self._deal_one(next_player)
+                self.curr_player = next_player
+
+                obs = self._get_obs(next_player)
+                action_options = self._get_action_options(next_player)
+                return obs, action_options, None, False
+            else:
+                # 100 张牌已经发完：确定庄家与主花色，发底牌给庄家，进入扣底阶段
+                if self.banker_pos is None or self.banker_pos not in range(4):
+                    if self.snatcher is not None:
+                        self.banker_pos = self.snatcher
+                    elif self.reporter is not None:
+                        self.banker_pos = self.reporter
+                    else:
+                        # 没有人报主：随机选庄家和主
+                        self.random_pick_major()
+
+                # 将原始底牌发给庄家
+                self._deliver_public()
+
+                # 庄家开始扣底
+                self.stage = self.STAGE_BURY
+                self.curr_player = self.banker_pos
+                # 重置 covered_card；真正的底牌将从庄家手中选出
+                self.covered_card = []
+                self.bury_left = len(self.card_public)
+
+                obs = self._get_obs(self.curr_player)
+                action_options = self._get_action_options(self.curr_player)
+                return obs, action_options, None, False
+
+        # ---------- STAGE 1: 庄家扣底 ----------
+        if self.stage == self.STAGE_BURY:
+            assert curr_player == self.curr_player == self.banker_pos
+
+            options = self._get_action_options(curr_player)
+            if not options:
+                raise Error("No bury options for banker")
+
+            if action_idx < 0 or action_idx >= len(options):
+                raise Error(f"Invalid action index {action_idx} for player {curr_player} in BURY stage")
+
+            chosen_names = options[action_idx]
+            chosen_ids = self._name2id_seq(chosen_names, self.player_decks[curr_player])
+
+            self._bury(chosen_ids)   # 更新 covered_card 并从庄家手中移除
+            self.bury_left -= len(chosen_ids)
+
+            if self.bury_left <= 0:
+                # 扣底完成，进入正式出牌阶段
+                # 此时主花色已确定，构建 Major 集和 move_generator
+                self._setMajor()
+                self.mv_gen = move_generator(self.level, self.major)
+
+                self.stage = self.STAGE_PLAY
+                self.curr_player = self.banker_pos
+                # 重置一墩的历史
+                self.history = []
+            else:
+                # 继续让庄家扣底
+                self.curr_player = self.banker_pos
+
+            obs = self._get_obs(self.curr_player)
+            action_options = self._get_action_options(self.curr_player)
+            return obs, action_options, None, False
+
+        # ---------- STAGE 2: 正常出牌 ----------
+        if self.stage == self.STAGE_PLAY:
+            assert curr_player == self.curr_player
+
+            options = self._get_action_options(curr_player)
+            if not options:
+                raise Error("No play options available")
+
+            if action_idx < 0 or action_idx >= len(options):
+                raise Error(f"Invalid action index {action_idx} for player {curr_player} in PLAY stage")
+
+            chosen_names = options[action_idx]
+            chosen_ids = self._name2id_seq(chosen_names, self.player_decks[curr_player])
+
+            real_action = self._checkLegalMove(chosen_ids, curr_player)
+            real_action_ids = self._name2id_seq(real_action, self.player_decks[curr_player])
+            self._play(curr_player, real_action_ids)
+
+            next_player = (curr_player + 1) % 4
+
+            # 一墩打完
+            if len(self.history) == 4:
                 winner = self._checkWinner(curr_player)
-                self.curr_player = winner
-                if len(self.player_decks[0]) == 0: # Ending the game
+                next_player = winner
+                if len(self.player_decks[0]) == 0:
+                    # 全部打完，游戏结束
                     self._reveal(curr_player, winner)
                     self.done = True
-            
-            # Note: self.round is incremented in original per card play or per trick?
-            # Original: self.round += 1 at end of step. round seems to track turns.
+
+            self.curr_player = next_player
             self.round += 1
 
-        if self.reward:
-             return self._get_obs(self.curr_player), self._get_action_options(self.curr_player), self.reward, self.done
-        return self._get_obs(self.curr_player), self._get_action_options(self.curr_player), None, self.done
+            obs = self._get_obs(next_player)
+            action_options = self._get_action_options(next_player)
+            if self.reward:
+                return obs, action_options, self.reward, self.done
+            return obs, action_options, None, self.done
 
-    def _end_snatch(self):
-        self._setMajor()
-        self.mv_gen = move_generator(self.level, self.major)
-        self._deliver_public()
-        self.stage = self.STAGE_BURY
-        self.curr_player = self.banker_pos
-        self.covered_cards = []
+        # 不应该走到这里
+        raise Error(f"Invalid game stage {self.stage}")
 
-    def _get_action_options(self, player):
-        return self._get_action_options_internal(player)
-        
-    def _get_action_options_internal(self, player):
-        deck = [self._id2name(p) for p in self.player_decks[player]]
-        
-        if self.stage == self.STAGE_SNATCH:
-            return self.mv_gen.gen_snatch(deck, self.reporter)
-            
-        elif self.stage == self.STAGE_BURY:
-            if player == self.banker_pos:
-                return self.mv_gen.gen_bury(deck)
-            else:
-                return [[]] # Dummy for others
-                
-        elif self.stage == self.STAGE_PLAY:
-            if len(self.history) == 4 or len(self.history) == 0: 
-                return self.mv_gen.gen_all(deck)
-            else:
-                tgt = [self._id2name(p) for p in self.history[0]]
-                poktype = self._checkPokerType(self.history[0], (player-len(self.history))%4)
-                if poktype == "single":
-                    return self.mv_gen.gen_single(deck, tgt)
-                elif poktype == "pair":
-                    return self.mv_gen.gen_pair(deck, tgt)
-                elif poktype == "tractor":
-                    return self.mv_gen.gen_tractor(deck, tgt)
-                elif poktype == "suspect":
-                    return self.mv_gen.gen_throw(deck, tgt)
-        return []
+    def _report(self, repo_card_ids, reporter):
+        """
+        repo_card_ids: list[int]，长度为 1
+        不能用大小王报主。
+        """
+        if self.reporter is not None:
+            self._raise_error(reporter, "ALREADY_REPORTED")
 
-    def _raise_error(self, player, info):
-        raise Error("Player_"+str(player)+": "+info)
-        
+        repo_name = self._id2name(repo_card_ids[0])
+        # 必须是级牌且不是大小王
+        if repo_name in ("jo", "Jo") or repo_name[1] != self.level:
+            self._raise_error(reporter, "INVALID_MOVE")
+
+        self.major = repo_name[0]
+        self.reporter = reporter
+
+    def _snatch(self, snatch_card_ids, snatcher):
+        """
+        snatch_card_ids: list[int]，长度为 2，必须是合法对子（级牌对子或大小王对子）。
+        """
+        if self.reporter is None:
+            self._raise_error(snatcher, "CANNOT_SNATCH")
+        if self.snatcher is not None:
+            self._raise_error(snatcher, "ALREADY_SNATCHED")
+
+        if (snatch_card_ids[1] - snatch_card_ids[0]) % 54 != 0:
+            self._raise_error(snatcher, "INVALID_MOVE")
+
+        snatch_name = self._id2name(snatch_card_ids[0])
+        # 大小王对：无主；其他情况用级牌花色
+        if snatch_name[1] == 'o':
+            self.major = 'n'
+        else:
+            if snatch_name[1] != self.level:
+                self._raise_error(snatcher, "INVALID_MOVE")
+            self.major = snatch_name[0]
+
+        self.snatcher = snatcher
+
+    def random_pick_major(self):
+        """发牌阶段没人报主时，随机选庄和主。"""
+        if self.first_round:
+            self.banker_pos = random.choice(range(4))
+        self.major = random.choice(self.suit_set)
+
+    def _deliver_public(self):
+        """将原始底牌发给庄家（真正的底牌之后由庄家从手牌中选出）。"""
+        for card in self.card_public:
+            self.player_decks[self.banker_pos].append(card)
+
+    def _bury(self, cover_cards):
+        """庄家扣底：从庄家手牌中移除 cover_cards 放入 covered_card。"""
+        for card in cover_cards:
+            self.covered_card.append(card)
+            self.player_decks[self.banker_pos].remove(card)
+
     def _get_obs(self, player):
         obs = {
             "id": player,
-            "stage": self.stage, # Added stage
             "deck": [self._id2name(p) for p in self.player_decks[player]],
             "history": [[self._id2name(p) for p in move] for move in self.history],
             "major": self.Major,
-            "played": [[self._id2name(p) for p in move] for move in self.played_cards]
+            "played": [[self._id2name(p) for p in move] for move in self.played_cards],
+            "stage": self.stage,
         }
         return obs
+
+    def _get_action_options(self, player):
+        """
+        按阶段返回 action options（全部是*牌名列表*）：
+
+        - STAGE_SNATCH: 报主 / 反主 / 不报
+        - STAGE_BURY:   庄家扣底
+        - STAGE_PLAY:   正常出牌（用 move_generator）
+        """
+        deck_names = [self._id2name(p) for p in self.player_decks[player]]
+
+        if self.stage == self.STAGE_SNATCH:
+            return self._get_declaration_options(player, deck_names)
+
+        if self.stage == self.STAGE_BURY:
+            return self._get_bury_options(player, deck_names)
+
+        # default: STAGE_PLAY
+        return self._get_play_options(player, deck_names)
+
+    def _get_declaration_options(self, player, deck_names):
+        """
+        SNATCH 阶段的报主 / 反主动作：
+        options[0] 永远是 [] 代表“pass”。
+        """
+        options = [[]]  # pass
+
+        # 没有人报主 -> 可以用单张级牌（非大小王）报主
+        if self.reporter is None:
+            for name in deck_names:
+                if len(name) == 2 and name[1] == self.level and name not in ("jo", "Jo"):
+                    options.append([name])
+
+        # 已经有人报主，但还没人反主 -> 可以用级牌对子或大小王对子反主
+        if (self.reporter is not None) and (self.snatcher is None):
+            cnt = Counter(deck_names)
+            # 级牌对子
+            for name, c in cnt.items():
+                if len(name) == 2 and name[1] == self.level and c >= 2:
+                    options.append([name, name])
+            # 大小王对子
+            for joker in ("jo", "Jo"):
+                if cnt[joker] >= 2:
+                    options.append([joker, joker])
+
+        return options
+
+    def _get_bury_options(self, player, deck_names):
+        """
+        庄家扣底选牌：这里给一个最简单版本——一次选一张。
+        你之后可以自己扩展为“一次选多张”。
+        """
+        if player != self.banker_pos:
+            return []
+
+        return [[name] for name in deck_names]
+
+    def _get_play_options(self, player, deck_names):
+        """
+        正常出牌阶段，沿用原来的 mvGen 逻辑。
+        """
+        if len(self.history) == 4 or len(self.history) == 0:  # 首家出牌
+            return self.mv_gen.gen_all(deck_names)
+        else:
+            tgt = [self._id2name(p) for p in self.history[0]]
+            poktype = self._checkPokerType(self.history[0], (player - len(self.history)) % 4)
+            if poktype == "single":
+                return self.mv_gen.gen_single(deck_names, tgt)
+            elif poktype == "pair":
+                return self.mv_gen.gen_pair(deck_names, tgt)
+            elif poktype == "tractor":
+                return self.mv_gen.gen_tractor(deck_names, tgt)
+            elif poktype == "suspect":
+                return self.mv_gen.gen_throw(deck_names, tgt)
+            else:
+                return []
+
+        
+    
+
+    
+        
+    
     
     # ... Helper functions from original env.py (Play, Snatch, etc) ...
     # Keeping original implementations where possible
@@ -245,36 +426,7 @@ class TractorEnv():
             self.history = []
         self.history.append(cards)
         
-    def _report(self, repo_card: list, reporter): 
-        # repo_card is list of str names here because comes from options
-        # Need name2id to get suit? Or just parse name
-        # The original code took list[int] from action
-        # Here input is list[str] from options
-        repo_name = repo_card[0]
-        major_suit = repo_name[0]
-        self.major = major_suit
-        self.reporter = reporter
-        self._setMajor() # Update major list immediately
     
-    def _snatch(self, snatch_card: list, snatcher):
-        snatch_name = snatch_card[0]
-        if snatch_name[1] == 'o': 
-            self.major = 'n'
-        else:
-            self.major = snatch_name[0]
-        self.snatcher = snatcher
-        self.reporter = snatcher # Snatcher becomes reporter
-        self._setMajor()
-
-    def random_pick_major(self): 
-        if self.first_round: 
-            self.banker_pos = random.choice(range(4))
-        self.major = random.choice(self.suit_set)
-        self._setMajor()
-
-    def _deliver_public(self): 
-        for card in self.public_card:
-            self.player_decks[self.banker_pos].append(card)
             
     def _reveal(self, currplayer, winner): 
         # Logic from original
@@ -288,7 +440,7 @@ class TractorEnv():
             else: mult = 2
 
         publicscore = 0
-        for pok in self.covered_cards: # Fixed var name
+        for pok in self.covered_card: # Fixed var name
             p = self._id2name(pok)
             if p[1] == "5": publicscore += 5
             elif p[1] == "0" or p[1] == "K": publicscore += 10
@@ -693,53 +845,50 @@ class TractorEnv():
             self.score -= points
         else:
             self.score += points
+    def _raise_error(self, player, msg):
+        raise Error(f"Player {player}: {msg}")
+    
+    def _checkLegalMove(self, chosen_ids, currplayer):
+        """
+        根据当前阶段和历史，修正/确认一个动作对应的真实出牌列表（牌名列表）。
 
-    def action_intpt(self, action, player):
-        # Already handled partially in step, but wrapper calls this
-        # action here is LIST of card names
-        player_deck = self.player_decks[player]
-        # In new version, step takes action INDEX from options.
-        # But this function might be used by Actor to log 'action'?
-        # Wait, existing Actor calls action_intpt with 'action_cards'.
-        # Actor: response = env.action_intpt(action_cards, player)
-        # So this function just wraps it into dict.
-        # But wait, original action_intpt converts name2id_seq.
-        # My step function takes index? 
-        # Actually my step function in this new code assumes `response['action']` is `action_index`.
-        # BUT the original step takes `response['action']` as list of IDs!
-        # Let's align.
-        # Actor calls: `response = env.action_intpt(action_cards, player)`
-        # Then `env.step(response)`.
-        # So action_intpt should package the data needed by step.
-        # If I want `step` to use index (for cleaner logic), I should pass index.
-        # But `action_cards` is what Actor gets from `action_options[action_index]`.
-        # If I want `step` to use `action_index`, Actor needs to pass `action` (int).
-        # But `env.step` signature in `actor.py` is fixed unless I change it.
-        # Let's change `actor.py` to pass the index directly or let `action_intpt` return index.
-        # However, `action_intpt` receives `action_cards` (list of strings). It doesn't know the index!
-        # The actor has the index `action`.
-        
-        # FIX: Modify `actor.py` to pass the index.
-        # OR: Modify `action_intpt` to just return card IDs, and `step` uses card IDs to figure out logic.
-        # But for Burying, dealing with IDs is annoying.
-        # Easier: `step` takes Index.
-        # So `action_intpt` is deprecated or needs to change signature?
-        # User said "更改...接口".
-        # Let's stick to: Step takes Index.
-        # So I will modify `actor.py` later.
-        # Here `action_intpt` can just return the index if passed?
-        # No, let's make `action_intpt` return the dict with `action` being the index.
-        # But `action_intpt` in `actor.py` is called with `action_options[action]`.
-        # I should change `actor.py` to NOT look up `action_options` before calling `action_intpt`?
-        # Or just pass the integer `action` to `action_intpt`.
-        
-        # New signature for action_intpt to be compatible with my new step:
-        # It just passes the index through.
-        pass
+        约定：
+        - 训练时，Actor 传进来的 `chosen_ids` 一定是当前 `action_options` 中某个元素
+          对应的那一组牌的 ID（即已经是 move_generator 挑出来的“形式合法动作”）。
+        - 因此这里不再重复做“跟牌是否合法”的细节校验（那个已经在
+          `_get_action_options` + `move_generator` 中完成）。
+        - 我们只在「首家出牌」时处理“甩牌”的判定，让它和论文 / 原始环境一致。
+        """
 
-    # I'll update action_intpt to accept int and pass it.
-    # But wait, the previous code used action_intpt to convert str->int IDs.
-    # My new step logic uses `_get_action_options_internal` to look up cards from index.
-    # So step expects index.
-    pass
+        # 把 id 转回牌名（便于和 _checkThrow 等逻辑复用）
+        deck_names = [self._id2name(p) for p in chosen_ids]
 
+        # 如果这一墩是首家出牌（history 为空或已经打完一整墩重新开始）
+        if len(self.history) == 0 or len(self.history) == 4:
+            # 使用已有的甩牌判定逻辑：
+            #   - check=True 表示按照原始环境里的规则，判断这一手甩牌是否合法
+            #   - final_groups: List[List[str]]，表示最终被允许“甩出去”的若干牌型
+            #   - ilcnt: 非 0 表示有不合法部分，被自动缩减为较小的合法牌型
+            final_groups, ilcnt = self._checkThrow(deck_names, currplayer, check=True)
+
+            # _checkThrow 的返回有两种典型形态：
+            #   1) 多个牌型组成的甩牌：例如 [[tractor1], [pair1], [pair2], ...]
+            #   2) 被裁剪成单一牌型：例如 [[pair1]]
+            # 对于 env 来说，我们只需要把所有这些牌 flatten 成一个出牌集合即可。
+            real_names = []
+            for group in final_groups:
+                # group 本身就是一个牌名列表
+                real_names.extend(group)
+
+            # 注意：real_names 是牌名列表（例如 ["sA", "sA", "sK", "sK"]）
+            return real_names
+
+        # 非首家出牌：
+        # 这里的合法性已经由 move_generator.gen_single / gen_pair / gen_tractor / gen_throw
+        # 严格保证了（包括跟牌、同花色、主牌优先等复杂规则）。
+        # 我们只需要把 id 转回牌名即可。
+        return deck_names
+
+
+
+    

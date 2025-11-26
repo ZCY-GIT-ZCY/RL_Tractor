@@ -116,24 +116,44 @@ def cover_Pub(old_public, deck):
     return old_public
 
 def playCard(history, hold, played, level, wrapper, mv_gen, model):
-    # generating obs
+    """
+    history: 当前这一轮（局部）历史，来自 Botzone 的 curr_request["history"][1]
+    hold:    自己当前手牌（Botzone 牌 id 列表）
+    played:  四家已经打出的牌（id 列表的列表）
+    level:   级牌点数（如 '2', '3', ...）
+    """
+
+    # 1. 构造 obs（注意这里用的是牌名）
     obs = {
         "id": selfid,
         "deck": [Num2Poker(p) for p in hold],
         "history": [[Num2Poker(p) for p in move] for move in history],
         "major": [Num2Poker(p) for p in Major],
-        "played": [[Num2Poker(p) for p in cardset] for cardset in played]
+        "played": [[Num2Poker(p) for p in cardset] for cardset in played],
     }
-    # generating action_options
-    action_options = get_action_options(hold, history, level, mv_gen) 
-    # generating state
-    state = {}
-    obs_mat, action_mask = wrapper.obsWrap(obs, action_options)
-    state['observation'] = torch.tensor(obs_mat, dtype = torch.float).unsqueeze(0)
-    state['action_mask'] = torch.tensor(action_mask, dtype = torch.float).unsqueeze(0)
-    # getting actions
-    action = obs2action(model, state)
-    response = action_intpt(action_options[action], hold)
+
+    # 2. 生成合法动作集合（牌名形式）
+    action_options = get_action_options(hold, history, level, mv_gen)
+    if not action_options:
+        # 理论上 mv_gen 一定能生成至少一个动作；这里加个兜底，直接 pass（不出牌）
+        return []
+
+    # 3. 用 wrapper 编码 obs + action_options
+    obs_mat, action_mask, _stage_from_wrapper = wrapper.obsWrap(obs, action_options)
+
+    # 4. 组装模型输入
+    state = {
+        "observation": torch.tensor(obs_mat, dtype=torch.float32).unsqueeze(0),   # (1, 128, 4, 14)
+        "action_mask": torch.tensor(action_mask, dtype=torch.float32).unsqueeze(0),  # (1, 54)
+        # Botzone 这里只在“出牌阶段”调用，所以直接用 PLAY = 2 对应的 head
+        "stage": torch.tensor([2], dtype=torch.long),  # (1,)
+    }
+
+    # 5. 调模型选一个 action index
+    action_idx = obs2action(model, state)
+
+    # 6. 把 action（牌名列表）转成 Botzone 要的牌 id 列表
+    response = action_intpt(action_options[action_idx], hold)
     return response
 
 
@@ -153,13 +173,21 @@ def get_action_options(deck, history, level, mv_gen):
         elif poktype == "suspect":
             return mv_gen.gen_throw(deck, tgt)    
 
-def obs2action(model, obs):
-    model.train(False) # Batch Norm inference mode
+def obs2action(model, state):
+    """
+    state: {
+        "observation": (1, 128, 4, 14) tensor,
+        "action_mask": (1, 54) tensor,
+        "stage":       (1,) tensor
+    }
+    """
+    model.eval()
     with torch.no_grad():
-        logits, value = model(obs)
-        action_dist = torch.distributions.Categorical(logits = logits)
-        action = action_dist.sample().item()
+        logits, value = model(state)  # logits 已经是 mask 之后的
+        # 这里可以采样，也可以贪心；我这里给你用贪心，稳定一点
+        action = torch.argmax(logits, dim=-1).item()
     return action
+
 
 def action_intpt(action, deck):
     '''
