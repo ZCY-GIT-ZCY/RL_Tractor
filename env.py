@@ -22,6 +22,7 @@ class TractorEnv():
         self.major = None
         self.level = None
         self.agent_names = ['player_%d' % i for i in range(4)]
+        self.mode = None
         
         
     def reset(self, level='2', banker_pos=0, major='s'):
@@ -46,10 +47,10 @@ class TractorEnv():
         # self.covered_card = self.total_deck[100:]
         self.card_todeal = self.total_deck[:100]
         self.player_decks = [[] for _ in range(4)]
-        self.player_decks[0] = self.card_todeal[:25]
-        self.player_decks[1] = self.card_todeal[25:50]
-        self.player_decks[2] = self.card_todeal[50:75]
-        self.player_decks[3] = self.card_todeal[75:100]
+        # self.player_decks[0] = self.card_todeal[:25]
+        # self.player_decks[1] = self.card_todeal[25:50]
+        # self.player_decks[2] = self.card_todeal[50:75]
+        # self.player_decks[3] = self.card_todeal[75:100]
         self._setMajor()
         self.mv_gen = move_generator(self.level, self.major)
         # assuming that covered_cards are publiccards
@@ -61,6 +62,7 @@ class TractorEnv():
         self.reward = None
         self.done = False
         self.round = 0 # 轮次计数器
+        self.mode = 'deal'  # Initialize mode to 'deal'
         
         self.round += 1
         # Do the first round
@@ -104,6 +106,8 @@ class TractorEnv():
             else:
                 new_deliver = self._deal()
                 next_player = (curr_player + 1) % 4
+        else: # playing stage
+            self.mode = "play"
         real_action = self._checkLegalMove(action, curr_player)
         real_action = self._name2id_seq(real_action, self.player_decks[curr_player])
         self._play(curr_player, real_action)
