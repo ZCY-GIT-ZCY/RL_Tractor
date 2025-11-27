@@ -13,7 +13,6 @@ data = np.load(DATA_PATH)
 
 obs = data["observation"]
 mask = data["action_mask"]
-stage = data["stage"]
 labels = data["action"]
 
 num_samples = obs.shape[0]
@@ -27,8 +26,6 @@ obs_train = torch.from_numpy(obs[train_idx]).type(torch.float32)
 obs_test = torch.from_numpy(obs[test_idx]).type(torch.float32)
 mask_train = torch.from_numpy(mask[train_idx]).type(torch.float32)
 mask_test = torch.from_numpy(mask[test_idx]).type(torch.float32)
-stage_train = torch.from_numpy(stage[train_idx]).type(torch.long)
-stage_test = torch.from_numpy(stage[test_idx]).type(torch.long)
 Y_train = torch.from_numpy(labels[train_idx]).type(torch.long)
 Y_test = torch.from_numpy(labels[test_idx]).type(torch.long)
 
@@ -39,11 +36,10 @@ optimizer = optim.Adam(CNN_Action_model.parameters(), 5e-5)
 idx = 0
 current_loss = float("inf")
 
-def build_state(observation, action_mask, stage_tensor):
+def build_state(observation, action_mask):
     return {
         "observation": observation,
         "action_mask": action_mask,
-        "stage": stage_tensor,
     }
 
 while float(current_loss) >= THRESHOLD:
@@ -51,7 +47,7 @@ while float(current_loss) >= THRESHOLD:
     CNN_Action_model.train()
     optimizer.zero_grad()
 
-    train_state = build_state(obs_train, mask_train, stage_train)
+    train_state = build_state(obs_train, mask_train)
     y_logits, _ = CNN_Action_model(train_state)
     current_loss = loss_fn(y_logits, Y_train)
     current_loss.backward()
@@ -59,7 +55,7 @@ while float(current_loss) >= THRESHOLD:
 
     CNN_Action_model.eval()
     with torch.inference_mode():
-        test_state = build_state(obs_test, mask_test, stage_test)
+        test_state = build_state(obs_test, mask_test)
         y_test_logits, _ = CNN_Action_model(test_state)
         test_loss = loss_fn(y_test_logits, Y_test)
 

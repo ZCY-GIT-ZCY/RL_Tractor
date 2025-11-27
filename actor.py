@@ -49,8 +49,7 @@ class Actor(Process):
             episode_data = {agent_name: {
                 'state' : {
                     'observation': [],
-                    'action_mask': [],
-                    'stage': [] # Add stage storage
+                    'action_mask': []
                 },
                 'action' : [],
                 'reward' : [],
@@ -63,16 +62,13 @@ class Actor(Process):
                 agent_name = env.agent_names[player]
                 agent_data = episode_data[agent_name]
                 
-                # Wrapper now returns stage
-                obs_mat, action_mask, stage_val = self.wrapper.obsWrap(obs, action_options)
+                obs_mat, action_mask = self.wrapper.obsWrap(obs, action_options)
                 
                 agent_data['state']['observation'].append(obs_mat)
                 agent_data['state']['action_mask'].append(action_mask)
-                agent_data['state']['stage'].append(stage_val)
                 
                 state['observation'] = torch.tensor(obs_mat, dtype = torch.float).unsqueeze(0)
                 state['action_mask'] = torch.tensor(action_mask, dtype = torch.float).unsqueeze(0)
-                state['stage'] = torch.tensor(stage_val, dtype = torch.long).unsqueeze(0) # Add stage to input
                 
                 model.train(False) # Batch Norm inference mode
                 with torch.no_grad():
@@ -107,8 +103,6 @@ class Actor(Process):
                 
                 obs = np.stack(agent_data['state']['observation'][:length])
                 mask = np.stack(agent_data['state']['action_mask'][:length])
-                stage = np.array(agent_data['state']['stage'][:length], dtype=np.int64) 
-                
                 actions = np.array(agent_data['action'][:length], dtype = np.int64)
                 rewards = np.array(agent_data['reward'][:length], dtype = np.float32)
                 values = np.array(agent_data['value'][:length], dtype = np.float32)
@@ -134,8 +128,7 @@ class Actor(Process):
                 self.replay_buffer.push({
                     'state': {
                         'observation': obs,
-                        'action_mask': mask,
-                        'stage': stage # Push stage
+                        'action_mask': mask
                     },
                     'action': actions,
                     'adv': advantages,

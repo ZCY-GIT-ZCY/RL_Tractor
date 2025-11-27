@@ -6,6 +6,7 @@ from wrapper import cardWrapper
 from mvGen import move_generator
 import numpy as np
 from collections import Counter
+from declaration import decide_declaration, decide_overcall
 
 cardscale = ['A','2','3','4','5','6','7','8','9','0','J','Q','K']
 suitset = ['s','h','c','d']
@@ -139,7 +140,7 @@ def playCard(history, hold, played, level, wrapper, mv_gen, model):
         return []
 
     # 3. 用 wrapper 编码 obs + action_options
-    obs_mat, action_mask, _stage_from_wrapper = wrapper.obsWrap(obs, action_options)
+    obs_mat, action_mask = wrapper.obsWrap(obs, action_options)
 
     # 4. 组装模型输入
     state = {
@@ -177,8 +178,7 @@ def obs2action(model, state):
     """
     state: {
         "observation": (1, 128, 4, 14) tensor,
-        "action_mask": (1, 54) tensor,
-        "stage":       (1,) tensor
+        "action_mask": (1, 54) tensor
     }
     """
     model.eval()
@@ -237,7 +237,8 @@ if curr_request["stage"] == "deal":
     called = curr_request["global"]["banking"]["called"]
     snatched = curr_request["global"]["banking"]["snatched"]
     level = curr_request["global"]["level"]
-    response = call_Snatch(get_card, hold, called, snatched, level)
+    current_trump = curr_request["global"]["banking"].get("major")
+    response = call_Snatch(get_card, hold, called, snatched, level, current_trump)
 elif curr_request["stage"] == "cover":
     publiccard = curr_request["deliver"]
     response = cover_Pub(publiccard, hold)

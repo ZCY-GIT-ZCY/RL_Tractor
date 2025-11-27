@@ -118,8 +118,6 @@ class cardWrapper:
         options: 当前阶段所有合法动作（牌名列表的列表）
         """
         pid = obs['id']
-        stage = obs.get('stage', 0)  # 默认 0，防御性
-
         # major / deck: 每个是 (2,4,14)
         major_mat  = np.zeros((2, 4, 14), dtype=np.float32)
         deck_mat   = np.zeros((2, 4, 14), dtype=np.float32)
@@ -162,4 +160,4 @@ class cardWrapper:
 
         # 最终观测：128 = 2 + 2 + 8 + 8 + 108
         obs_mat = np.concatenate((major_mat, deck_mat, hist_mat, played_mat, option_mat), axis=0)
-        return obs_mat, action_mask, stage
+        return obs_mat, action_mask

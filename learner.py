@@ -42,12 +42,9 @@ class Learner(Process):
             batch = self.replay_buffer.sample(self.config['batch_size'])
             obs = torch.tensor(batch['state']['observation']).to(device)
             mask = torch.tensor(batch['state']['action_mask']).to(device)
-            stage = torch.tensor(batch['state']['stage']).to(device) # Unpack stage
-            
             states = {
                 'observation': obs,
-                'action_mask': mask,
-                'stage': stage # Pass to model
+                'action_mask': mask
             }
             actions = torch.tensor(batch['action']).unsqueeze(-1).to(device)
             advs = torch.tensor(batch['adv']).to(device)
