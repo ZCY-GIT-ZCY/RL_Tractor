@@ -7,11 +7,54 @@ from mvGen import move_generator
 import numpy as np
 from collections import Counter
 from declaration import decide_declaration, decide_overcall
+from kitty import select_kitty_cards
 
 cardscale = ['A','2','3','4','5','6','7','8','9','0','J','Q','K']
 suitset = ['s','h','c','d']
 Major = ['jo', 'Jo']
 pointorder = ['2','3','4','5','6','7','8','9','0','J','Q','K','A']
+PLAYER_ID_KEYS = ("player", "player_id", "playerID", "self", "self_id", "seat_id")
+SELF_PLAYER_ID = None
+
+
+def maybe_update_self_player(container):
+    global SELF_PLAYER_ID
+    if not isinstance(container, dict):
+        return SELF_PLAYER_ID
+    for key in PLAYER_ID_KEYS:
+        value = container.get(key)
+        if isinstance(value, int):
+            SELF_PLAYER_ID = value % 4
+            return SELF_PLAYER_ID
+    return SELF_PLAYER_ID
+
+
+def _group_cards_by_name(cards):
+    grouped = {}
+    for card in cards:
+        name = Num2Poker(card)
+        grouped.setdefault(name, []).append(card)
+    return grouped
+
+
+def _pick_declaration_cards(grouped_cards, suit, level):
+    target = suit + level
+    candidates = grouped_cards.get(target, [])
+    return candidates[:1]
+
+
+def _pick_snatch_cards(grouped_cards, candidate, level):
+    if candidate == 'n':
+        for joker in ("Jo", "jo"):
+            possible = grouped_cards.get(joker, [])
+            if len(possible) >= 2:
+                return possible[:2]
+        return []
+    target = candidate + level
+    possible = grouped_cards.get(target, [])
+    if len(possible) >= 2:
+        return possible[:2]
+    return []
 
 def setMajor(major, level):
     global Major
@@ -92,29 +135,50 @@ def checkPokerType(poker, level): #poker: list[int]
     
     return "suspect"
     
-def call_Snatch(get_card, deck, called, snatched, level):
+def call_Snatch(get_card, deck, called, snatched, level, current_trump, self_player=None):
 # get_card: new card in this turn (int)
 # deck: your deck (list[int]) before getting the new card
 # called & snatched: player_id, -1 if not called/snatched
 # level: level
 # return -> list[int]
-    response = []
-## 目前的策略是一拿到牌立刻报/反，之后不再报/反
-## 不反无主
-    deck_poker = [Num2Poker(id) for id in deck]
-    get_poker = Num2Poker(get_card)
-    if get_poker[1] == level:
-        if called == -1:
-            response = [get_card]
-        elif snatched == -1:
-            if (get_card + 54) % 108 in deck:
-                response = [get_card, (get_card + 54) % 108]
-    return response
+    hand_ids = list(deck)
+    if get_card is not None:
+        hand_ids.append(get_card)
+    grouped_cards = _group_cards_by_name(hand_ids)
 
-def cover_Pub(old_public, deck):
+    if snatched not in (-1, None):
+        return []
+
+    if called in (-1, None):
+        candidate = decide_declaration(hand_ids, level)
+        if not candidate:
+            return []
+        cards = _pick_declaration_cards(grouped_cards, candidate, level)
+        return cards if cards else []
+
+    teammate_called = None
+    if self_player is not None:
+        if called == self_player:
+            return []
+        teammate_id = (self_player + 2) % 4
+        teammate_called = called == teammate_id
+
+    active_trump = current_trump or 'n'
+    candidate = decide_overcall(
+        hand_ids,
+        level,
+        active_trump,
+        teammate_called=teammate_called,
+    )
+    if not candidate:
+        return []
+    cards = _pick_snatch_cards(grouped_cards, candidate, level)
+    return cards if cards else []
+
+def cover_Pub(old_public, deck, level, major):
 # old_public: raw publiccard (list[int])
-## 直接盖回去
-    return old_public
+    full_hand = list(deck) + list(old_public)
+    return select_kitty_cards(full_hand, level, major, len(old_public))
 
 def playCard(history, hold, played, level, wrapper, mv_gen, model):
     """
@@ -203,6 +267,7 @@ if _online:
 else:
     with open("log_forAI.json") as fo:
         full_input = json.load(fo)
+maybe_update_self_player(full_input)
 
 # loading model
 model = CNNModel()
@@ -213,6 +278,7 @@ hold = []
 played = [[], [], [], []]
 for i in range(len(full_input["requests"])-1):
     req = full_input["requests"][i]
+    maybe_update_self_player(req)
     if req["stage"] == "deal":
         hold.extend(req["deliver"])
     elif req["stage"] == "cover":
@@ -223,6 +289,7 @@ for i in range(len(full_input["requests"])-1):
     elif req["stage"] == "play":
         history = req["history"]
         selfid = (history[3] + len(history[1])) % 4
+        maybe_update_self_player({"player": selfid})
         if len(history[0]) != 0:
             self_move = history[0][(selfid-history[2]) % 4]
             #print(hold)
@@ -232,16 +299,19 @@ for i in range(len(full_input["requests"])-1):
             for player_rec in range(len(history[0])): # Recovering played cards
                 played[(history[2]+player_rec) % 4].extend(history[0][player_rec])
 curr_request = full_input["requests"][-1]
+maybe_update_self_player(curr_request)
 if curr_request["stage"] == "deal":
     get_card = curr_request["deliver"][0]
     called = curr_request["global"]["banking"]["called"]
     snatched = curr_request["global"]["banking"]["snatched"]
     level = curr_request["global"]["level"]
     current_trump = curr_request["global"]["banking"].get("major")
-    response = call_Snatch(get_card, hold, called, snatched, level, current_trump)
+    response = call_Snatch(get_card, hold, called, snatched, level, current_trump, SELF_PLAYER_ID)
 elif curr_request["stage"] == "cover":
     publiccard = curr_request["deliver"]
-    response = cover_Pub(publiccard, hold)
+    level = curr_request["global"]["level"]
+    major = curr_request["global"]["banking"]["major"]
+    response = cover_Pub(publiccard, hold, level, major)
 elif curr_request["stage"] == "play":
     level = curr_request["global"]["level"]
     major = curr_request["global"]["banking"]["major"]
@@ -252,6 +322,7 @@ elif curr_request["stage"] == "play":
     
     history = curr_request["history"]
     selfid = (history[3] + len(history[1])) % 4
+    maybe_update_self_player({"player": selfid})
     if len(history[0]) != 0:
         self_move = history[0][(selfid-history[2]) % 4]
         #print(hold)

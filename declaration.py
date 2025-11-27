@@ -30,17 +30,17 @@ TRUMP_CANDIDATES = ['s', 'h', 'c', 'd', 'n']  # 'n' denotes no-trump / joker tru
 # ---------------------------------------------------------------------------
 # Tunable hyper-parameters (easy to tweak)
 # ---------------------------------------------------------------------------
-T_CALL = 8.0
-T_OVERCALL_HIGH = 11.0
-DELTA_OVERCALL_MARGIN = 2.0
-T_SUPPORT_FRIEND = 6.0
-T_OVERCALL_TEAM = 10.0
-T_FRIEND_BAD = 3.0
-JOKER_BONUS = 3.0
-LEVEL_CARD_BONUS = 1.0
-BIG_AK_BONUS = 0.5
-BASE_TRUMP_POINTS = 1.0
-TRACTOR_BONUS = 2.0
+T_CALL = 7.0    # Minimum score to make a declaration
+T_OVERCALL_HIGH = 11.0  # Minimum score to consider overcalling
+DELTA_OVERCALL_MARGIN = 2.0   # Minimum score lead over enemy trump to overcall
+T_SUPPORT_FRIEND = 6.0 # Minimum score to support teammate's call
+T_OVERCALL_TEAM = 10.0  # Minimum score to overcall when supporting teammate
+T_FRIEND_BAD = 3.0  # Maximum score to consider teammate's trump "bad"
+JOKER_BONUS = 3.0  # Bonus per joker in trump
+LEVEL_CARD_BONUS = 1.0  # Bonus per level card in trump
+BIG_AK_BONUS = 0.5 # Bonus per Ace or King in trump
+BASE_TRUMP_POINTS = 1.0   # Base points per trump card
+TRACTOR_BONUS = 2.0  # Bonus per tractor group in trump
 
 
 def num_to_poker(card: int) -> str:
@@ -78,16 +78,16 @@ def is_trump(card: str, candidate: str, level: str) -> bool:
 
 
 def count_pairs(trump_cards: List[str]) -> Counter:
-    cnt = Counter()
-    for card in trump_cards:
-        cnt[card] += 1
-    return cnt
+    """Return occurrences of every trump card."""
+    return Counter(trump_cards)
 
 
-def tractor_groups(pair_cards: List[str], candidate: str, level: str) -> int:
+def tractor_groups(pair_counts: Counter, candidate: str, level: str) -> int:
     """Approximate number of tractor groups (two or more consecutive pairs)."""
-    # Use ranks converted to integer order
     def rank_value(card: str) -> int:
+        """Map a card to a comparable rank score."""
+        if card in ("jo", "Jo"):
+            return -1  # jokers cannot form tractors
         rank = card[1]
         order = CARD_SCALE.index(rank)
         # Level cards should be highest in their suit
@@ -95,19 +95,19 @@ def tractor_groups(pair_cards: List[str], candidate: str, level: str) -> int:
             return len(CARD_SCALE) + 2
         return order
 
-    # Keep only cards that have at least two copies
-    counts = Counter(pair_cards)
-    usable = sorted(
-        [card for card, c in counts.items() if c >= 2],
-        key=lambda c: rank_value(c),
+    usable_values = sorted(
+        {
+            rank_value(card)
+            for card, cnt in pair_counts.items()
+            if cnt >= 2 and card not in ("jo", "Jo")
+        }
     )
-    if not usable:
+    if not usable_values:
         return 0
 
-    values = [rank_value(card) for card in usable]
     tractor = 0
     streak = 1
-    for prev, cur in zip(values, values[1:]):
+    for prev, cur in zip(usable_values, usable_values[1:]):
         if cur == prev + 1:
             streak += 1
         else:
@@ -134,8 +134,7 @@ def evaluate_trump_strength(hand: Iterable, candidate: str, level: str) -> Tuple
     pair_counts = count_pairs(trump_cards)
     tractor_bonus = 0
     if pair_counts:
-        pair_list = [card for card, cnt in pair_counts.items() if cnt >= 2]
-        tractor_bonus = TRACTOR_BONUS * tractor_groups(pair_list, candidate, level)
+        tractor_bonus = TRACTOR_BONUS * tractor_groups(pair_counts, candidate, level)
 
     score = base + ak_bonus + level_bonus + joker_bonus + tractor_bonus
     stats = {
@@ -172,12 +171,12 @@ def decide_declaration(hand: Iterable, level: str) -> Optional[str]:
     best_score = scores[best_suits[0]]
     if best_score < T_CALL:
         return None
-    # Preferred ordering when scores tie: no-trump > level suit > rest suits
-    if 'n' in best_suits:
-        return 'n'
-    level_suit = next((suit for suit in best_suits if suit != 'n' and suit == level), None)
-    if level_suit:
-        return level_suit
+    # No-trump cannot be declared directly; drop it unless it is the only option.
+    filtered = [suit for suit in best_suits if suit != 'n']
+    if filtered:
+        best_suits = filtered
+    elif best_suits == ['n']:
+        return None
     priority = ['s', 'h', 'c', 'd']
     for suit in priority:
         if suit in best_suits:
@@ -185,13 +184,18 @@ def decide_declaration(hand: Iterable, level: str) -> Optional[str]:
     return best_suits[0]
 
 
-def decide_overcall(hand: Iterable, level: str, enemy_trump: str, teammate_called: bool = False) -> Optional[str]:
+def decide_overcall(
+    hand: Iterable,
+    level: str,
+    enemy_trump: str,
+    teammate_called: Optional[bool] = None,
+) -> Optional[str]:
     scores = evaluate_all_trumps(hand, level)
     my_best_suit = max(scores, key=lambda k: scores[k])
     my_best_score = scores[my_best_suit]
     enemy_score = scores.get(enemy_trump, 0.0)
 
-    if teammate_called:
+    if teammate_called is True:
         # Support teammate unless current trump is terrible
         teammate_score = enemy_score
         if teammate_score >= T_SUPPORT_FRIEND:
@@ -221,4 +225,3 @@ __all__ = [
     "decide_declaration",
     "decide_overcall",
 ]
-
