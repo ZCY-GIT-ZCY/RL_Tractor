@@ -23,6 +23,17 @@ class Learner(Process):
         # initialize model params
         device = torch.device(self.config['device'])
         model = CNNModel()
+        init_model_path = self.config.get('init_model_path')
+        if init_model_path:
+            if os.path.isfile(init_model_path):
+                state_dict = torch.load(init_model_path, map_location='cpu')
+                try:
+                    model.load_state_dict(state_dict)
+                    print(f"[Learner] Loaded initial weights from {init_model_path}")
+                except RuntimeError as err:
+                    print(f"[Learner] Failed to load initial weights: {err}")
+            else:
+                print(f"[Learner] init_model_path {init_model_path} not found, training from scratch.")
         
         # send to model pool
         model_pool.push(model.state_dict()) # push cpu-only tensor to model_pool

@@ -8,6 +8,8 @@ from env import TractorEnv
 from model import CNNModel
 
 from wrapper import cardWrapper
+from declaration import decide_declaration, decide_overcall
+from kitty import select_kitty_cards
 
 class Actor(Process):
     
@@ -57,34 +59,47 @@ class Actor(Process):
             } for agent_name in env.agent_names}
             done = False
             while not done:
-                state = {}
+                stage = obs.get('stage', TractorEnv.STAGE_PLAY)
                 player = obs['id']
                 agent_name = env.agent_names[player]
                 agent_data = episode_data[agent_name]
-                
+
+                # handle declaration / kitty stages via rule-based heuristics
+                if stage == TractorEnv.STAGE_SNATCH:
+                    action = self._select_declaration_action(env, obs, action_options)
+                    response = {'player': player, 'action': action}
+                    next_obs, action_options, rewards, done = env.step(response)
+                    obs = next_obs
+                    continue
+                if stage == TractorEnv.STAGE_BURY:
+                    action = self._select_bury_action(env, action_options)
+                    response = {'player': player, 'action': action}
+                    next_obs, action_options, rewards, done = env.step(response)
+                    obs = next_obs
+                    continue
+
+                state = {}
                 obs_mat, action_mask = self.wrapper.obsWrap(obs, action_options)
-                
+
                 agent_data['state']['observation'].append(obs_mat)
                 agent_data['state']['action_mask'].append(action_mask)
-                
+
                 state['observation'] = torch.tensor(obs_mat, dtype = torch.float).unsqueeze(0)
                 state['action_mask'] = torch.tensor(action_mask, dtype = torch.float).unsqueeze(0)
-                
+
                 model.train(False) # Batch Norm inference mode
                 with torch.no_grad():
                     logits, value = model(state)
                     action_dist = torch.distributions.Categorical(logits = logits)
                     action = action_dist.sample().item()
                     value = value.item()
-                    
+
                 agent_data['action'].append(action)
                 agent_data['value'].append(value)
                 agent_data['reward'].append(0) # Initialize reward for this step
-                
-                # interpreting actions
-                # Pass index directly as per new Env interface
+
                 response = {'player': player, 'action': action}
-                
+
                 # interact with env
                 next_obs, action_options, rewards, done = env.step(response)
                 if rewards:
@@ -134,3 +149,59 @@ class Actor(Process):
                     'adv': advantages,
                     'target': td_target
                 })
+
+    def _select_declaration_action(self, env: TractorEnv, obs, action_options):
+        """
+        Use rule-based heuristics for declaring or overcalling trump during the snatch stage.
+        """
+        level = env.level
+        deck = obs.get('deck', [])
+        if env.reporter is None:
+            candidate = decide_declaration(deck, level)
+            if not candidate:
+                return 0  # pass
+            target = [candidate + level]
+            idx = self._find_option_index(action_options, target)
+            return idx if idx is not None else 0
+
+        candidate = decide_overcall(deck, level, env.major or 'n')
+        if not candidate:
+            return 0
+        if candidate == 'n':
+            for joker in ("Jo", "jo"):
+                idx = self._find_option_index(action_options, [joker, joker])
+                if idx is not None:
+                    return idx
+            return 0
+        target = [candidate + level, candidate + level]
+        idx = self._find_option_index(action_options, target)
+        return idx if idx is not None else 0
+
+    def _select_bury_action(self, env: TractorEnv, action_options):
+        """
+        Use the kitty heuristics to pick a single card to bury at this step.
+        """
+        banker = env.banker_pos
+        if banker is None:
+            return 0
+        bury_count = env.bury_left
+        deck_ids = list(env.player_decks[banker])
+        selected = select_kitty_cards(deck_ids, env.level, env.major or 'n', bury_count)
+        if not selected:
+            return 0
+        target_name = env._id2name(selected[0])
+        idx = self._find_option_index(action_options, [target_name])
+        if idx is not None:
+            return idx
+        return 0
+
+    @staticmethod
+    def _find_option_index(action_options, target_cards):
+        if not action_options:
+            return None
+        for idx, option in enumerate(action_options):
+            if len(option) != len(target_cards):
+                continue
+            if option == target_cards:
+                return idx
+        return None

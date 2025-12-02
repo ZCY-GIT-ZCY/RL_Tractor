@@ -1,13 +1,13 @@
 import json
 import os
-from data.Tractor_Project.model import CNNModel
+from data.model import CNNModel
 import torch
-from data.Tractor_Project.wrapper import cardWrapper
-from data.Tractor_Project.mvGen import move_generator
+from data.wrapper import cardWrapper
+from data.mvGen import move_generator
 import numpy as np
 from collections import Counter
-from data.Tractor_Project.declaration import decide_declaration, decide_overcall
-from data.Tractor_Project.kitty import select_kitty_cards
+from data.declaration import decide_declaration, decide_overcall
+from data.kitty import select_kitty_cards
 
 cardscale = ['A','2','3','4','5','6','7','8','9','0','J','Q','K']
 suitset = ['s','h','c','d']
@@ -38,22 +38,50 @@ def _group_cards_by_name(cards):
 
 
 def _pick_declaration_cards(grouped_cards, suit, level):
+    """
+    Select the strongest available evidence when declaring a trump.
+    Priority:
+        1. Pair of jokers (for no-trump)
+        2. Pair of level cards in candidate suit
+        3. Single level card
+    """
+    if suit == 'n':
+        for joker in ("Jo", "jo"):
+            candidates = grouped_cards.get(joker, [])
+            if len(candidates) >= 2:
+                return candidates[:2]
+        big = grouped_cards.get("Jo", [])
+        small = grouped_cards.get("jo", [])
+        if big and small:
+            return [big[0], small[0]]
+        return []
+
     target = suit + level
-    candidates = grouped_cards.get(target, [])
-    return candidates[:1]
+    level_cards = grouped_cards.get(target, [])
+    if len(level_cards) >= 2:
+        return level_cards[:2]
+    if level_cards:
+        return level_cards[:1]
+    return []
 
 
 def _pick_snatch_cards(grouped_cards, candidate, level):
+    """
+    When overcalling, Botzone only accepts:
+      - Pair of Jokers (for no-trump)
+      - Pair of level cards in the candidate suit
+    """
     if candidate == 'n':
         for joker in ("Jo", "jo"):
             possible = grouped_cards.get(joker, [])
             if len(possible) >= 2:
                 return possible[:2]
         return []
+
     target = candidate + level
-    possible = grouped_cards.get(target, [])
-    if len(possible) >= 2:
-        return possible[:2]
+    level_cards = grouped_cards.get(target, [])
+    if len(level_cards) >= 2:
+        return level_cards[:2]
     return []
 
 def setMajor(major, level):
@@ -154,7 +182,10 @@ def call_Snatch(get_card, deck, called, snatched, level, current_trump, self_pla
         if not candidate:
             return []
         cards = _pick_declaration_cards(grouped_cards, candidate, level)
-        return cards if cards else []
+        if cards:
+            return cards
+        # fallback: pass
+        return []
 
     teammate_called = None
     if self_player is not None:
@@ -173,12 +204,25 @@ def call_Snatch(get_card, deck, called, snatched, level, current_trump, self_pla
     if not candidate:
         return []
     cards = _pick_snatch_cards(grouped_cards, candidate, level)
-    return cards if cards else []
+    if cards:
+        return cards
+    return []
 
 def cover_Pub(old_public, deck, level, major):
-# old_public: raw publiccard (list[int])
+    """
+    Choose which cards to bury when receiving the kitty.
+    Uses the scoring strategy from data.kitty to iteratively discard the weakest cards,
+    balancing the desire to void short suits with the need to protect point cards.
+    """
     full_hand = list(deck) + list(old_public)
-    return select_kitty_cards(full_hand, level, major, len(old_public))
+    bury_count = len(old_public)
+    selected = select_kitty_cards(full_hand, level, major, bury_count)
+    # selected is a list of card ids to discard; remove them from hand
+    remaining = list(full_hand)
+    for card in selected:
+        if card in remaining:
+            remaining.remove(card)
+    return selected
 
 def playCard(history, hold, played, level, wrapper, mv_gen, model):
     """
