@@ -2,6 +2,7 @@ from multiprocessing import Process
 import time
 import numpy as np
 import torch
+import os
 from torch.nn import functional as F
 
 from replay_buffer import ReplayBuffer
@@ -81,6 +82,8 @@ class Learner(Process):
             t = time.time()
             if t - cur_time > self.config['ckpt_save_interval']:
                 path = self.config['ckpt_save_path'] + 'model_%d.pt' % iterations
+                if not os.path.exists(self.config['ckpt_save_path']):
+                    os.makedirs(self.config['ckpt_save_path'])
                 torch.save(model.state_dict(), path)
                 cur_time = t
             iterations += 1

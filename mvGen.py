@@ -17,7 +17,47 @@ class move_generator():
         else:
             self.Major = [suit + self.level for suit in self.suit_set] + self.Major
         
+    def gen_snatch(self, deck, reporter=None):
+        '''
+        Generate snatch/report options.
+        deck: player's deck
+        reporter: current reporter info (None or specific) - logic handled in Env usually, 
+                  but here we generate valid cards.
+        '''
+        moves = []
+        # Always allow 'Pass' - represented as empty list []
+        moves.append([]) 
         
+        # Find all level cards in deck
+        level_cards = [p for p in deck if p[1] == self.level]
+        count = Counter(level_cards)
+        
+        if reporter is None:
+            # Can report single level card
+            for k in count.keys():
+                moves.append([k])
+        else:
+            # Must snatch with pair of level cards
+            for k, v in count.items():
+                if v >= 2:
+                    moves.append([k, k])
+                    
+        return moves
+
+    def gen_bury(self, deck):
+        '''
+        Generate bury options.
+        deck: player's deck
+        Returns each unique card as an option (to be selected one by one).
+        '''
+        moves = []
+        # Unique cards in deck can be chosen
+        unique_cards = list(set(deck))
+        unique_cards.sort() # Ensure deterministic order
+        for card in unique_cards:
+            moves.append([card])
+        return moves
+
     def gen_single(self, deck, tgt):
         '''
         deck: player's deck
@@ -236,5 +276,3 @@ class move_generator():
                     moves.append(tracstreak+[])
                     
         return moves
-        
-        
