@@ -1,13 +1,13 @@
 import json
 import os
-from data.Tractor_Project.model import CNNModel
+from data.model import CNNModel
 import torch
-from data.Tractor_Project.wrapper import cardWrapper
-from data.Tractor_Project.mvGen import move_generator
+from data.wrapper import cardWrapper
+from data.mvGen import move_generator
 import numpy as np
 from collections import Counter
-from data.Tractor_Project.declaration import decide_declaration, decide_overcall
-from data.Tractor_Project.kitty import select_kitty_cards
+from data.declaration import decide_declaration, decide_overcall
+from data.kitty import select_kitty_cards
 
 cardscale = ['A','2','3','4','5','6','7','8','9','0','J','Q','K']
 suitset = ['s','h','c','d']
