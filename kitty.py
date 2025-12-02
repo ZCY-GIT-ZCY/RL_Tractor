@@ -1,20 +1,19 @@
 """
 Rule-based kitty (bury) strategy.
 
-The selector scores every card in the banker's hand and discards the weakest
-ones.  Scores follow a simple additive model so hyper-parameters are easy to
-adjust without touching the logic.
+The selector scores the hand iteratively and enforces a strict preference:
+1) Always bury off-suit cards that are neither Aces nor (future) trump bonuses.
+2) Only if necessary, allow off-suit Aces.
+3) Only when the whole hand is trump do we consider burying trump cards.
 """
 
 from collections import Counter, defaultdict
 from typing import Dict, Iterable, List, Sequence, Tuple
 
-CARD_SCALE = ['2', '3', '4', '5', '6', '7', '8', '9', '0', 'J', 'Q', 'K', 'A']
+CARD_SCALE = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '0', 'J', 'Q', 'K']
 SUITS = ['s', 'h', 'c', 'd']
 
-# ---------------------------------------------------------------------------
 # Tunable weights
-# ---------------------------------------------------------------------------
 BASE_WEAKNESS = {
     '2': 7.0,
     '3': 6.5,
@@ -23,41 +22,35 @@ BASE_WEAKNESS = {
     '6': 5.0,
     '7': 4.5,
     '8': 4.0,
-    '9': 3.0,
-    '0': 0.0,  # ten is a score card
-    'J': 2.0,
+    '9': 3.5,
+    '0': 0.0,
+    'J': 1.5,
     'Q': 1.0,
-    'K': 0.0,
-    'A': -1.0,
+    'K': 0.5,
+    'A': -3.0,
 }
-DEFAULT_WEAKNESS = 2.0  
-ISOLATION_BONUS = {1: 4.0, 2: 2.0, 3: 1.0} 
+DEFAULT_WEAKNESS = 2.0
+ISOLATION_BONUS = {1: 4.0, 2: 2.0, 3: 1.0}
 NO_CONTROL_PENALTY = 2.5
 SCORE_CARD_RISK = 5.0
 SCORE_RISK_COUNT_THRESHOLD = 2
-TRUMP_PROTECTION = 6.0
-LEVEL_PROTECTION = 8.0
-JOKER_PROTECTION = 20.0
-PAIR_PROTECTION = 3.0
-TRACTOR_PROTECTION = 5.0
-TRACTOR_HEAD_EXTRA = 1.0  # makes the tractor head effectively -6
-VOID_TARGET_COUNT = 2  # aim to void short suits when possible
-VOID_PRIORITY_BONUS = 4.0  # extra weakness when voiding a suit
-POINT_RISK_MULT_HIGH = 1.5  # multiplier when protection is weak
-POINT_RISK_MULT_LOW = 0.8   # multiplier when protection is strong
-TRUMP_LACK_PENALTY = 1.5  # soft penalty when kitty lacks big trumps
+TRUMP_PROTECTION = 10.0
+LEVEL_PROTECTION = 14.0
+JOKER_PROTECTION = 25.0
+PAIR_PROTECTION = 4.0
+TRACTOR_PROTECTION = 6.0
+TRACTOR_HEAD_EXTRA = 1.5
+VOID_TARGET_COUNT = 2
+VOID_PRIORITY_BONUS = 4.0
+POINT_RISK_MULT_HIGH = 1.6
+POINT_RISK_MULT_LOW = 0.8
+TRUMP_LACK_PENALTY = 1.5
+OFFSUIT_ACE_PROTECTION = 6.0
 
 
 def _dynamic_scales(hand_size: int, final_size: int, initial_bury: int) -> Tuple[float, float, float]:
-    """
-    Return (isolaton_scale, risk_scale, protection_scale) based on how many
-    cards still need to be buried. When many cards remain to bury (aggressive
-    phase) we amplify risk penalties to shed points quickly; as we approach the
-    target hand size we increase protection to avoid breaking strong structures.
-    """
-    remaining_to_bury = max(0, hand_size - final_size)
-    aggressiveness = remaining_to_bury / max(1, initial_bury)
-    aggressiveness = min(1.0, max(0.0, aggressiveness))
+    remaining = max(0, hand_size - final_size)
+    aggressiveness = min(1.0, max(0.0, remaining / max(1, initial_bury)))
     isolation_scale = 0.6 + 0.9 * aggressiveness
     risk_scale = 0.6 + 0.9 * aggressiveness
     protection_scale = 1.0 + (1.0 - aggressiveness)
@@ -65,24 +58,18 @@ def _dynamic_scales(hand_size: int, final_size: int, initial_bury: int) -> Tuple
 
 
 def num_to_name(card: int) -> str:
-    num_in_deck = card % 54
-    if num_in_deck == 52:
+    num = card % 54
+    if num == 52:
         return "jo"
-    if num_in_deck == 53:
+    if num == 53:
         return "Jo"
-    rank = CARD_SCALE[num_in_deck // 4]
-    suit = SUITS[num_in_deck % 4]
+    rank = CARD_SCALE[num // 4]
+    suit = SUITS[num % 4]
     return suit + rank
 
 
-def normalize_cards(cards: Iterable) -> List[str]:
-    normalized: List[str] = []
-    for card in cards:
-        if isinstance(card, str):
-            normalized.append(card)
-        else:
-            normalized.append(num_to_name(int(card)))
-    return normalized
+def normalize_cards(cards: Iterable[int]) -> List[str]:
+    return [num_to_name(int(card)) for card in cards]
 
 
 def is_trump(name: str, major: str, level: str) -> bool:
@@ -102,14 +89,8 @@ def _rank_value(rank: str, level: str) -> int:
     return CARD_SCALE.index(rank)
 
 
-def _build_suit_panel(
-    name_counter: Counter,
-    major: str,
-    level: str,
-) -> Dict[str, Dict[str, bool]]:
-    info: Dict[str, Dict[str, bool]] = {
-        suit: defaultdict(bool, count=0) for suit in SUITS
-    }
+def _build_suit_panel(name_counter: Counter, major: str, level: str) -> Dict[str, Dict[str, bool]]:
+    info: Dict[str, Dict[str, bool]] = {suit: defaultdict(bool, count=0) for suit in SUITS}
     for suit in SUITS:
         info[suit]['count'] = 0
 
@@ -129,8 +110,7 @@ def _build_suit_panel(
         ranks = [
             rank
             for rank in CARD_SCALE
-            if name_counter[f"{suit}{rank}"] >= 2
-            and not is_trump(f"{suit}{rank}", major, level)
+            if name_counter[f"{suit}{rank}"] >= 2 and not is_trump(f"{suit}{rank}", major, level)
         ]
         streak = []
         prev = None
@@ -148,9 +128,7 @@ def _build_suit_panel(
         if not has_tractor and len(streak) >= 2:
             has_tractor = True
         info[suit]['has_tractor'] = has_tractor
-        info[suit]['no_control'] = not (
-            info[suit]['has_ace'] or info[suit]['has_pair'] or has_tractor
-        )
+        info[suit]['no_control'] = not (info[suit]['has_ace'] or info[suit]['has_pair'] or has_tractor)
     return info
 
 
@@ -158,9 +136,7 @@ def _tractor_memberships(name_counter: Counter, level: str) -> Tuple[set, set]:
     members = set()
     heads = set()
     for suit in SUITS:
-        ranked_pairs = [
-            rank for rank in CARD_SCALE if name_counter[f"{suit}{rank}"] >= 2
-        ]
+        ranked_pairs = [rank for rank in CARD_SCALE if name_counter[f"{suit}{rank}"] >= 2]
         if len(ranked_pairs) < 2:
             continue
         streak: List[str] = []
@@ -207,8 +183,6 @@ def _score_card(
         score -= TRUMP_PROTECTION * protection_scale
         if rank == level:
             score -= LEVEL_PROTECTION * protection_scale
-        if rank in ('0', 'K', '5'):
-            score += SCORE_CARD_RISK * 0.4 * score_risk_multiplier
     else:
         count = suit_panel[suit]['count']
         score += ISOLATION_BONUS.get(count, 0.0) * isolation_scale
@@ -217,6 +191,10 @@ def _score_card(
         if rank in ('K', '0', '5'):
             if count <= SCORE_RISK_COUNT_THRESHOLD or suit_panel[suit].get('no_control'):
                 score += SCORE_CARD_RISK * risk_scale * score_risk_multiplier
+        if rank == level:
+            score -= LEVEL_PROTECTION * protection_scale
+        if rank == 'A':
+            score -= OFFSUIT_ACE_PROTECTION * protection_scale
         if void_targets.get(suit):
             score += VOID_PRIORITY_BONUS * isolation_scale
 
@@ -241,9 +219,6 @@ def select_kitty_cards(
     major: str,
     bury_count: int,
 ) -> List[int]:
-    """
-    Select `bury_count` cards to discard from `hand`.
-    """
     if bury_count <= 0:
         return []
     cards = list(hand)
@@ -280,59 +255,47 @@ def select_kitty_cards(
                 score_risk_multiplier += 0.2
             score_risk_multiplier = min(score_risk_multiplier, POINT_RISK_MULT_HIGH)
 
-        trump_deficit = 0.0
-        if not has_big:
-            trump_deficit += TRUMP_LACK_PENALTY
-        if small_pairs == 0:
-            trump_deficit += TRUMP_LACK_PENALTY * 0.5
-
         void_targets = {}
-        sorted_suits = sorted(
-            SUITS,
-            key=lambda suit: suit_panel[suit]['count'],
-        )
+        sorted_suits = sorted(SUITS, key=lambda suit: suit_panel[suit]['count'])
         for suit in sorted_suits[:VOID_TARGET_COUNT]:
-            if suit_panel[suit]['count'] <= 2 and not any(
-                is_trump(f"{suit}{rank}", major, level)
-                for rank in CARD_SCALE
-            ):
+            if suit_panel[suit]['count'] <= 2 and not any(is_trump(f"{suit}{rank}", major, level) for rank in CARD_SCALE):
                 void_targets[suit] = True
 
-        prefer_offsuit = any(not is_trump(name, major, level) for name in names)
-        prefer_safe_non_ace = any(
-            (not is_trump(name, major, level)) and name[1] != 'A'
-            for name in names
+        off_trump_indices = [idx for idx, name in enumerate(names) if not is_trump(name, major, level)]
+        off_trump_non_special = [
+            idx for idx in off_trump_indices
+            if names[idx][1] != 'A' and names[idx][1] != level
+        ]
+        off_trump_non_level = [
+            idx for idx in off_trump_indices
+            if names[idx][1] != level
+        ]
+        candidate_indices = (
+            off_trump_non_special
+            or off_trump_non_level
+            or off_trump_indices
+            or list(range(len(cards)))
         )
 
-        def _append_scores(allow_trump: bool, allow_aces: bool):
-            local_scored = []
-            for idx, (card_id, name) in enumerate(zip(cards, names)):
-                if prefer_offsuit and not allow_trump and is_trump(name, major, level):
-                    continue
-                if prefer_safe_non_ace and not allow_aces and name[1] == 'A' and not is_trump(name, major, level):
-                    continue
-                score = _score_card(
-                    name,
-                    suit_panel,
-                    pair_names,
-                    tractor_members,
-                    tractor_heads,
-                    major,
-                    level,
-                    iso_scale,
-                    risk_scale,
-                    protection_scale,
-                    void_targets,
-                    score_risk_multiplier,
-                )
-                local_scored.append((score, _tie_break_key(name, level), idx))
-            return local_scored
-
-        scored = _append_scores(allow_trump=False, allow_aces=False)
-        if not scored:
-            scored = _append_scores(allow_trump=False, allow_aces=True)
-        if not scored:
-            scored = _append_scores(allow_trump=True, allow_aces=True)
+        scored = []
+        for idx in candidate_indices:
+            name = names[idx]
+            card_id = cards[idx]
+            score = _score_card(
+                name,
+                suit_panel,
+                pair_names,
+                tractor_members,
+                tractor_heads,
+                major,
+                level,
+                iso_scale,
+                risk_scale,
+                protection_scale,
+                void_targets,
+                score_risk_multiplier,
+            )
+            scored.append((score, _tie_break_key(name, level), idx))
 
         scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
         _, _, remove_idx = scored[0]
