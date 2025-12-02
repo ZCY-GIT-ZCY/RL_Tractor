@@ -40,7 +40,7 @@ class Actor(Process):
         policies = {player : model for player in env.agent_names} # all four players use the latest model
         
         for episode in range(self.config['episodes_per_actor']):
-            # tqdm 监控当前 actor 的单个 episode 进度
+            # tqdm 监控当前 actor 的单个 episode 进度（仅进度条与后缀，避免 print 刷屏）
             pbar = tqdm(total=None, desc=f"{self.name}", mininterval=0.5, smoothing=0.1)
             # update model
             latest = model_pool.get_latest_model()
@@ -129,7 +129,7 @@ class Actor(Process):
                     'model': latest_id,
                     'reward': f"{reward_sum:.2f}",
                 })
-            print(self.name, 'Episode', episode, 'Model', latest['id'], 'Reward', rewards)
+            # 结束本 episode，关闭进度条（不做额外打印）
             pbar.close()
             
             # postprocessing episode data for each agent
