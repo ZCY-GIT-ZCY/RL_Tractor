@@ -1,5 +1,6 @@
 __pycache__
-/*.pt
+*/*/*/*.pt
+/*/*.pt
 *.png
 slurm_logs
 exps
@@ -8,3 +9,6 @@ eval
 .sh
 shengji_plus
 .DS_Store
+.vscode
+*.npy
+*.npz
