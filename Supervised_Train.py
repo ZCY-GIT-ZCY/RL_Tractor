@@ -8,7 +8,6 @@ from tqdm import tqdm
 
 THRESHOLD = 5e-2
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-SEED = 123
 VERBOSE = 1
 VERBOSE_BATCH = 100
 SAVE_FREQ_EPOCH = 2
@@ -69,7 +68,7 @@ class NpyMemmapDataset(Dataset):
         return obs, mask, label
 
 num_samples = int(obs_arr.shape[0])
-rng = np.random.default_rng(SEED)
+rng = np.random.default_rng()
 all_indices = rng.permutation(num_samples)
 if SUBSAMPLE:
     all_indices = all_indices[:min(SUBSAMPLE, len(all_indices))]
@@ -113,7 +112,7 @@ if __name__ == '__main__':
     )
 
     model = CNNModel().to(DEVICE)
-    optimizer = optim.Adam(model.parameters(), lr=5e-5, weight_decay=1e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=3e-5, weight_decay=8e-3)
     # 简单 warmup + cosine 调度：前 5 个 epoch 线性升至目标 lr，然后余弦衰减
     WARMUP_EPOCHS = 5
     TOTAL_EPOCHS = MAX_EPOCHS
