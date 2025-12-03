@@ -25,7 +25,7 @@ if __name__ == '__main__':
         'device': 'cuda',  # device to run the model on
         'ckpt_save_interval': 180,  # checkpoint save interval in seconds
         'ckpt_save_path': 'checkpoint/',  # checkpoint save path
-        'init_model_path': 'Pre_trained_Data/Overfit/spv_model_epoch22_1.5072.pt',  # optional initial weights
+        'init_model_path': 'Pre_trained_Data/init_model.pt',  # optional initial weights
         # Global progress totals
         'learner_iterations': 10000,  # total learner iterations before stopping
         'normalize_adv': True,
