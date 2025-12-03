@@ -4,7 +4,6 @@ import numpy as np
 import torch
 import os
 from torch.nn import functional as F
-from tqdm import tqdm
 
 from replay_buffer import ReplayBuffer
 from model_pool import ModelPoolServer
@@ -16,6 +15,9 @@ class Learner(Process):
         super(Learner, self).__init__()
         self.replay_buffer = replay_buffer
         self.config = config
+        # Shared progress
+        self._iter_counter = config.get('learner_iter_counter')
+        self._done_event = config.get('learner_done_event')
     
     def run(self):
         # create model pool
@@ -49,8 +51,7 @@ class Learner(Process):
         
         cur_time = time.time()
         iterations = 0
-        # tqdm 监控：未知总长度的持续训练，用动态后缀展示指标
-        pbar = tqdm(total=None, desc="Learner", mininterval=0.5, smoothing=0.1)
+        target_iters = int(self.config.get('learner_iterations', 0))
         while True:
             # sample batch
             batch = self.replay_buffer.sample(self.config['batch_size'])
@@ -63,6 +64,11 @@ class Learner(Process):
             actions = torch.tensor(batch['action']).unsqueeze(-1).to(device)
             advs = torch.tensor(batch['adv']).to(device)
             targets = torch.tensor(batch['target']).to(device)
+
+            if self.config.get('normalize_adv', False):
+                adv_mean = advs.mean()
+                adv_std = advs.std(unbiased=False)
+                advs = (advs - adv_mean) / (adv_std + 1e-8)
             
             # 监控信息（轻量）：迭代与缓冲区
             # print 改为 tqdm.postfix 展示，更整洁
@@ -70,18 +76,23 @@ class Learner(Process):
             # calculate PPO loss
             model.train(True) # Batch Norm training mode
             old_logits, _ = model(states)
-            old_probs = F.softmax(old_logits, dim = 1).gather(1, actions)
-            old_log_probs = torch.log(old_probs).detach()
+            if not torch.isfinite(old_logits).all():
+                print("[Learner] Non-finite logits detected before update, aborting training cycle.")
+                break
+            old_log_probs = F.log_softmax(old_logits, dim=1).gather(1, actions).detach()
             last_policy_loss = None
             last_value_loss = None
             last_entropy_loss = None
             last_total_loss = None
             for _ in range(self.config['epochs']):
                 logits, values = model(states)
-                action_dist = torch.distributions.Categorical(logits = logits)
-                probs = F.softmax(logits, dim = 1).gather(1, actions)
-                log_probs = torch.log(probs)
-                ratio = torch.exp(log_probs - old_log_probs)
+                if (not torch.isfinite(logits).all()) or (not torch.isfinite(values).all()):
+                    print("[Learner] Non-finite tensor detected during update, stopping learner loop.")
+                    return
+                action_dist = torch.distributions.Categorical(logits=logits)
+                log_probs = F.log_softmax(logits, dim=1).gather(1, actions)
+                log_ratio = (log_probs - old_log_probs).clamp(-20, 20)
+                ratio = torch.exp(log_ratio)
                 surr1 = ratio * advs
                 surr2 = torch.clamp(ratio, 1 - self.config['clip'], 1 + self.config['clip']) * advs
                 policy_loss = -torch.mean(torch.min(surr1, surr2))
@@ -90,12 +101,15 @@ class Learner(Process):
                 loss = policy_loss + self.config['value_coeff'] * value_loss + self.config['entropy_coeff'] * entropy_loss
                 optimizer.zero_grad()
                 loss.backward()
+                max_grad_norm = self.config.get('max_grad_norm', 0)
+                if max_grad_norm and max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 optimizer.step()
                 # 保存最新一轮的可视化指标
-                last_policy_loss = policy_loss.detach().item()
-                last_value_loss = value_loss.detach().item()
-                last_entropy_loss = (-entropy_loss).detach().item()  # 显示正的熵值
-                last_total_loss = loss.detach().item()
+                last_policy_loss = float(policy_loss.detach().item())
+                last_value_loss = float(value_loss.detach().item())
+                last_entropy_loss = float((-entropy_loss).detach().item())  # 显示正的熵值
+                last_total_loss = float(loss.detach().item())
 
             # push new model
             model = model.to('cpu')
@@ -110,19 +124,20 @@ class Learner(Process):
                     os.makedirs(self.config['ckpt_save_path'])
                 torch.save(model.state_dict(), path)
                 cur_time = t
-                pbar.write(f"[CKPT] Saved {path}")
+                # checkpoint saved
             iterations += 1
-            # 更新 tqdm 显示
-            current_lr = optimizer.param_groups[0]['lr']
-            pbar.update(1)
-            pbar.set_postfix({
-                'iter': iterations,
-                'buf': self.replay_buffer.size(),
-                'in': self.replay_buffer.stats.get('sample_in', 0),
-                'out': self.replay_buffer.stats.get('sample_out', 0),
-                'lr': f"{current_lr:.2e}",
-                'pol': f"{(last_policy_loss if last_policy_loss is not None else float('nan')):.3f}",
-                'val': f"{(last_value_loss if last_value_loss is not None else float('nan')):.3f}",
-                'ent': f"{(last_entropy_loss if last_entropy_loss is not None else float('nan')):.3f}",
-                'loss': f"{(last_total_loss if last_total_loss is not None else float('nan')):.3f}",
-            })
+            # Update shared counter
+            if self._iter_counter is not None:
+                try:
+                    with self._iter_counter.get_lock():
+                        self._iter_counter.value += 1
+                except Exception:
+                    pass
+            # Check for completion
+            if target_iters and iterations >= target_iters:
+                if self._done_event is not None:
+                    try:
+                        self._done_event.set()
+                    except Exception:
+                        pass
+                break

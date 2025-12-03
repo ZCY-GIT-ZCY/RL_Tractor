@@ -19,6 +19,9 @@ class Actor(Process):
         self.replay_buffer = replay_buffer
         self.config = config
         self.name = config.get('name', 'Actor-?')
+        # Shared progress counter (Value)
+        self._episode_counter = config.get('actor_episode_counter')
+        self._episodes_total = int(config.get('episodes_total', 0))
         
     def run(self):
         torch.set_num_threads(1)
@@ -40,8 +43,13 @@ class Actor(Process):
         policies = {player : model for player in env.agent_names} # all four players use the latest model
         
         for episode in range(self.config['episodes_per_actor']):
-            # tqdm 监控当前 actor 的单个 episode 进度（仅进度条与后缀，避免 print 刷屏）
-            pbar = tqdm(total=None, desc=f"{self.name}", mininterval=0.5, smoothing=0.1)
+            # 增加全局采样进度计数
+            if self._episode_counter is not None:
+                try:
+                    with self._episode_counter.get_lock():
+                        self._episode_counter.value += 1
+                except Exception:
+                    pass
             # update model
             latest = model_pool.get_latest_model()
             if latest['id'] > version['id']:
@@ -129,16 +137,7 @@ class Actor(Process):
                 latest_id = latest['id'] if latest else -1
                 # 汇总当前奖励（若有）
                 reward_sum = sum(last_rewards.values()) if last_rewards else 0.0
-                pbar.update(1)
-                pbar.set_postfix({
-                    'ep': episode,
-                    'step': step_count,
-                    'stage': stage_name,
-                    'model': latest_id,
-                    'reward': f"{reward_sum:.2f}",
-                })
             # 结束本 episode，关闭进度条（不做额外打印）
-            pbar.close()
             
             # postprocessing episode data for each agent
             for agent_name, agent_data in episode_data.items():
