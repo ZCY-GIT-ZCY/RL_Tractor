@@ -1,6 +1,7 @@
 from multiprocessing import Process
 import numpy as np
 import torch
+from tqdm import tqdm
 
 from replay_buffer import ReplayBuffer
 from model_pool import ModelPoolClient
@@ -39,6 +40,8 @@ class Actor(Process):
         policies = {player : model for player in env.agent_names} # all four players use the latest model
         
         for episode in range(self.config['episodes_per_actor']):
+            # tqdm 监控当前 actor 的单个 episode 进度（仅进度条与后缀，避免 print 刷屏）
+            pbar = tqdm(total=None, desc=f"{self.name}", mininterval=0.5, smoothing=0.1)
             # update model
             latest = model_pool.get_latest_model()
             if latest['id'] > version['id']:
@@ -58,6 +61,8 @@ class Actor(Process):
                 'value' : []
             } for agent_name in env.agent_names}
             done = False
+            step_count = 0
+            last_rewards = {}
             while not done:
                 stage = obs.get('stage', TractorEnv.STAGE_PLAY)
                 player = obs['id']
@@ -116,8 +121,24 @@ class Actor(Process):
                         # Add to the last reward entry (credit assignment)
                         if len(episode_data[agent_name]['reward']) > 0:
                             episode_data[agent_name]['reward'][-1] += rewards[agent_name]
+                    last_rewards = rewards
                 obs = next_obs
-            print(self.name, 'Episode', episode, 'Model', latest['id'], 'Reward', rewards)
+                step_count += 1
+                # 更新 tqdm 后缀：显示步骤、阶段、最新模型 id 与即时奖励摘要
+                stage_name = {TractorEnv.STAGE_SNATCH: 'SNATCH', TractorEnv.STAGE_BURY: 'BURY', TractorEnv.STAGE_PLAY: 'PLAY'}.get(stage, 'PLAY')
+                latest_id = latest['id'] if latest else -1
+                # 汇总当前奖励（若有）
+                reward_sum = sum(last_rewards.values()) if last_rewards else 0.0
+                pbar.update(1)
+                pbar.set_postfix({
+                    'ep': episode,
+                    'step': step_count,
+                    'stage': stage_name,
+                    'model': latest_id,
+                    'reward': f"{reward_sum:.2f}",
+                })
+            # 结束本 episode，关闭进度条（不做额外打印）
+            pbar.close()
             
             # postprocessing episode data for each agent
             for agent_name, agent_data in episode_data.items():
