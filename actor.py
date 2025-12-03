@@ -90,8 +90,16 @@ class Actor(Process):
                 model.train(False) # Batch Norm inference mode
                 with torch.no_grad():
                     logits, value = model(state)
-                    action_dist = torch.distributions.Categorical(logits = logits)
-                    action = action_dist.sample().item()
+                    logits = logits.squeeze(0)
+                    mask_tensor = state['action_mask'].squeeze(0)
+                    valid_indices = torch.nonzero(mask_tensor > 0, as_tuple=False).squeeze(-1)
+                    if valid_indices.numel() == 0:
+                        action = 0
+                    else:
+                        valid_logits = logits[valid_indices]
+                        action_dist = torch.distributions.Categorical(logits=valid_logits)
+                        sampled = action_dist.sample()
+                        action = valid_indices[sampled].item()
                     value = value.item()
 
                 agent_data['action'].append(action)
