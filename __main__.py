@@ -48,18 +48,12 @@ def _pick_declaration_cards(grouped_cards, suit, level):
     if suit == 'n':
         for joker in ("Jo", "jo"):
             candidates = grouped_cards.get(joker, [])
-            if len(candidates) >= 2:
-                return candidates[:2]
-        big = grouped_cards.get("Jo", [])
-        small = grouped_cards.get("jo", [])
-        if big and small:
-            return [big[0], small[0]]
+            if candidates:
+                return candidates[:1]
         return []
 
     target = suit + level
     level_cards = grouped_cards.get(target, [])
-    if len(level_cards) >= 2:
-        return level_cards[:2]
     if level_cards:
         return level_cards[:1]
     return []
@@ -163,7 +157,7 @@ def checkPokerType(poker, level): #poker: list[int]
     
     return "suspect"
     
-def call_Snatch(get_card, deck, called, snatched, level, current_trump, self_player=None):
+def call_Snatch(get_card, deck, called, snatched, level, current_trump, self_player=None, need_snatch=False):
 # get_card: new card in this turn (int)
 # deck: your deck (list[int]) before getting the new card
 # called & snatched: player_id, -1 if not called/snatched
@@ -178,7 +172,7 @@ def call_Snatch(get_card, deck, called, snatched, level, current_trump, self_pla
         return []
 
     if called in (-1, None):
-        candidate = decide_declaration(hand_ids, level)
+        candidate = decide_declaration(hand_ids, level, force_on_level=need_snatch)
         if not candidate:
             return []
         cards = _pick_declaration_cards(grouped_cards, candidate, level)
@@ -350,7 +344,9 @@ if curr_request["stage"] == "deal":
     snatched = curr_request["global"]["banking"]["snatched"]
     level = curr_request["global"]["level"]
     current_trump = curr_request["global"]["banking"].get("major")
-    response = call_Snatch(get_card, hold, called, snatched, level, current_trump, SELF_PLAYER_ID)
+    banker = curr_request["global"]["banking"].get("banker", -1)
+    need_snatch = banker == -1
+    response = call_Snatch(get_card, hold, called, snatched, level, current_trump, SELF_PLAYER_ID, need_snatch=need_snatch)
 elif curr_request["stage"] == "cover":
     publiccard = curr_request["deliver"]
     level = curr_request["global"]["level"]

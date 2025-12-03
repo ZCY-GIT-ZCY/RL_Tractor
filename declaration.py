@@ -273,11 +273,19 @@ def profile_meets_declare(profile: Dict[str, float], hand_size: int, declare_thr
     return False
 
 
-def decide_declaration(hand: Iterable, level: str) -> Optional[str]:
+def decide_declaration(hand: Iterable, level: str, force_on_level: bool = False) -> Optional[str]:
     hand_list = list(hand)
     profiles = evaluate_all_trumps(hand_list, level)
     if not profiles:
         return None
+    if force_on_level:
+        normalized_hand = normalize_cards(hand_list)
+        for candidate in TRUMP_CANDIDATES:
+            if candidate == 'n':
+                continue
+            target = candidate + level
+            if target in normalized_hand:
+                return candidate
     hand_size = len(hand_list)
     declare_thr, overcall_thr, struct_margin, trump_req = dynamic_thresholds(hand_size)
     best = max(profiles.values(), key=lambda x: x["profile_tuple"])

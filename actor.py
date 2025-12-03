@@ -18,6 +18,7 @@ class Actor(Process):
         super(Actor, self).__init__()
         self.replay_buffer = replay_buffer
         self.config = config
+        self.auto_snatch_on_level = config.get('auto_snatch_on_level', True)
         self.name = config.get('name', 'Actor-?')
         # Shared progress counter (Value)
         self._episode_counter = config.get('actor_episode_counter')
@@ -185,7 +186,7 @@ class Actor(Process):
         level = env.level
         deck = obs.get('deck', [])
         if env.reporter is None:
-            candidate = decide_declaration(deck, level)
+            candidate = decide_declaration(deck, level, force_on_level=self.auto_snatch_on_level)
             if not candidate:
                 return 0  # pass
             target = [candidate + level]
