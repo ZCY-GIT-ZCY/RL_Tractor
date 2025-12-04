@@ -23,6 +23,7 @@ class Actor(Process):
         # Shared progress counter (Value)
         self._episode_counter = config.get('actor_episode_counter')
         self._episodes_total = int(config.get('episodes_total', 0))
+        self._stop_event = config.get('stop_event')
         
     def run(self):
         torch.set_num_threads(1)
@@ -44,13 +45,8 @@ class Actor(Process):
         policies = {player : model for player in env.agent_names} # all four players use the latest model
         
         for episode in range(self.config['episodes_per_actor']):
-            # 增加全局采样进度计数
-            if self._episode_counter is not None:
-                try:
-                    with self._episode_counter.get_lock():
-                        self._episode_counter.value += 1
-                except Exception:
-                    pass
+            if self._stop_event is not None and self._stop_event.is_set():
+                break
             # update model
             latest = model_pool.get_latest_model()
             if latest['id'] > version['id']:
@@ -73,6 +69,8 @@ class Actor(Process):
             step_count = 0
             last_rewards = {}
             while not done:
+                if self._stop_event is not None and self._stop_event.is_set():
+                    return
                 stage = obs.get('stage', TractorEnv.STAGE_PLAY)
                 player = obs['id']
                 agent_name = env.agent_names[player]
@@ -139,6 +137,12 @@ class Actor(Process):
                 # 汇总当前奖励（若有）
                 reward_sum = sum(last_rewards.values()) if last_rewards else 0.0
             # 结束本 episode，关闭进度条（不做额外打印）
+            if self._episode_counter is not None:
+                try:
+                    with self._episode_counter.get_lock():
+                        self._episode_counter.value += 1
+                except Exception:
+                    pass
             
             # postprocessing episode data for each agent
             for agent_name, agent_data in episode_data.items():

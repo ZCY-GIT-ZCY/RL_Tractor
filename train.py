@@ -7,27 +7,27 @@ import time
 
 if __name__ == '__main__':
     config = {
-        'replay_buffer_size': 75000,  # max number of samples in replay buffer
+        'replay_buffer_size': 70000,  # max number of samples in replay buffer
         'replay_buffer_episode': 1000,  # max number of episodes in replay buffer
         'model_pool_size': 20,  # max number of models in model pool
         'model_pool_name': 'model-pool',   # name of the model pool
         'num_actors': 6,  # number of parallel actors
-        'episodes_per_actor': 8000, # episodes per actor before restarting
-        'gamma': 0.98,  # discount factor
+        'episodes_per_actor': 80000, # episodes per actor before restarting
+        'gamma': 0.99,  # discount factor
         'lambda': 0.95,  # GAE lambda
         'min_sample': 10000,   # min samples before learner starts
         'batch_size': 128,   # batch size for learner
-        'epochs': 2,  # number of epochs per update
+        'epochs': 3,  # number of epochs per update
         'clip': 0.2,   # PPO clip parameter
-        'lr': 8e-5, # learning rate
+        'lr': 1e-4, # learning rate
         'value_coeff': 1,   # value loss coefficient
         'entropy_coeff': 0.01,  # entropy loss coefficient
         'device': 'cuda',  # device to run the model on
-        'ckpt_save_interval': 180,  # checkpoint save interval in seconds
+        'ckpt_save_interval': 1800,  # checkpoint save interval in seconds
         'ckpt_save_path': 'checkpoint/',  # checkpoint save path
         'init_model_path': 'Pre_trained_Data/init_model.pt',  # optional initial weights
         # Global progress totals
-        'learner_iterations': 10000,  # total learner iterations before stopping
+        'learner_iterations': 100000,  # total learner iterations before stopping
         'normalize_adv': True,
         'max_grad_norm': 1.0,
     }
@@ -38,6 +38,7 @@ if __name__ == '__main__':
     learner_iter_counter = Value('i', 0)
     actor_done = Event()
     learner_done = Event()
+    stop_event = Event()
 
     # Spawn processes
     actors = []
@@ -46,11 +47,13 @@ if __name__ == '__main__':
         cfg['name'] = 'Actor-%d' % i
         cfg['actor_episode_counter'] = actor_episode_counter
         cfg['episodes_total'] = config['episodes_per_actor'] * config['num_actors']
+        cfg['stop_event'] = stop_event
         actor = Actor(cfg, replay_buffer)
         actors.append(actor)
     learner_cfg = dict(config)
     learner_cfg['learner_iter_counter'] = learner_iter_counter
     learner_cfg['learner_done_event'] = learner_done
+    learner_cfg['stop_event'] = stop_event
     learner = Learner(learner_cfg, replay_buffer)
 
     for actor in actors:
@@ -64,6 +67,11 @@ if __name__ == '__main__':
         last_actor = 0
         last_learner = 0
         while True:
+            if stop_event.is_set():
+                actor_done.set()
+                learner_done.set()
+                break
+
             curr_actor = actor_episode_counter.value
             curr_learner = learner_iter_counter.value
             if curr_actor > last_actor:
@@ -83,6 +91,7 @@ if __name__ == '__main__':
                 break
             time.sleep(0.2)
     except KeyboardInterrupt:
+        stop_event.set()
         pass
     finally:
         actor_pbar.close()

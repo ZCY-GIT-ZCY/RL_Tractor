@@ -15,9 +15,10 @@ class Learner(Process):
         super(Learner, self).__init__()
         self.replay_buffer = replay_buffer
         self.config = config
-        # Shared progress
+        # Shared progress / coordination
         self._iter_counter = config.get('learner_iter_counter')
         self._done_event = config.get('learner_done_event')
+        self._stop_event = config.get('stop_event')
     
     def run(self):
         # create model pool
@@ -52,6 +53,7 @@ class Learner(Process):
         cur_time = time.time()
         iterations = 0
         target_iters = int(self.config.get('learner_iterations', 0))
+        stop_reason = None
         while True:
             # sample batch
             batch = self.replay_buffer.sample(self.config['batch_size'])
@@ -78,17 +80,21 @@ class Learner(Process):
             old_logits, _ = model(states)
             if not torch.isfinite(old_logits).all():
                 print("[Learner] Non-finite logits detected before update, aborting training cycle.")
+                stop_reason = "non_finite_old_logits"
                 break
             old_log_probs = F.log_softmax(old_logits, dim=1).gather(1, actions).detach()
             last_policy_loss = None
             last_value_loss = None
             last_entropy_loss = None
             last_total_loss = None
+            invalid_update = False
             for _ in range(self.config['epochs']):
                 logits, values = model(states)
                 if (not torch.isfinite(logits).all()) or (not torch.isfinite(values).all()):
                     print("[Learner] Non-finite tensor detected during update, stopping learner loop.")
-                    return
+                    stop_reason = "non_finite_update"
+                    invalid_update = True
+                    break
                 action_dist = torch.distributions.Categorical(logits=logits)
                 log_probs = F.log_softmax(logits, dim=1).gather(1, actions)
                 log_ratio = (log_probs - old_log_probs).clamp(-20, 20)
@@ -110,6 +116,8 @@ class Learner(Process):
                 last_value_loss = float(value_loss.detach().item())
                 last_entropy_loss = float((-entropy_loss).detach().item())  # 显示正的熵值
                 last_total_loss = float(loss.detach().item())
+            if invalid_update:
+                break
 
             # push new model
             model = model.to('cpu')
@@ -135,9 +143,26 @@ class Learner(Process):
                     pass
             # Check for completion
             if target_iters and iterations >= target_iters:
-                if self._done_event is not None:
-                    try:
-                        self._done_event.set()
-                    except Exception:
-                        pass
+                stop_reason = "max_iterations"
                 break
+
+        self._finalize(model, iterations, stop_reason)
+
+    def _finalize(self, model, iterations, stop_reason):
+        model_cpu = model.to('cpu')
+        ckpt_dir = self.config['ckpt_save_path']
+        os.makedirs(ckpt_dir, exist_ok=True)
+        final_path = os.path.join(ckpt_dir, f"model_final_iter{iterations}.pt")
+        torch.save(model_cpu.state_dict(), final_path)
+        print(f"[Learner] Saved final model to {final_path} (reason={stop_reason})")
+
+        if self._stop_event is not None:
+            try:
+                self._stop_event.set()
+            except Exception:
+                pass
+        if self._done_event is not None:
+            try:
+                self._done_event.set()
+            except Exception:
+                pass
