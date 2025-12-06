@@ -15,6 +15,7 @@ BIG_TRUMP_STRENGTH = 950
 TRUMP_TOTAL_ESTIMATE = 24
 ASSERTIVE_MIN_RANK = "J"
 LIGHT_MIN_RANK = "7"
+SAFE_LEAD_MIN_RANK = "Q"
 
 
 class RuleBasedModel(nn.Module):
@@ -94,6 +95,7 @@ class RuleBasedModel(nn.Module):
         score_state = self._infer_score_state(meta)
         void_map = self._normalize_void_map(meta)
         stage = self._classify_game_stage(len(played_cards) + len(history_cards_flat))
+        hand_suit_counts = self._count_suit_distribution(deck_cards, major_suit, level_rank)
         context = {
             "major": major_suit,
             "level": level_rank,
@@ -127,6 +129,7 @@ class RuleBasedModel(nn.Module):
             "trump_low_rounds_left": trump_remaining_estimate <= 8,
             "high_trump_seen": high_trump_seen,
             "no_trump_mark": hand_trump_count == 0,
+            "hand_suit_counts": hand_suit_counts,
         }
         context["teammate_flags"] = self._build_teammate_flags(context)
         context["teammate_void_suits"], context["enemy_void_suits"] = self._split_void_map(context)
@@ -238,6 +241,14 @@ class RuleBasedModel(nn.Module):
                 if len(card) == 2:
                     total += POINT_CARD_VALUES.get(card[1], 0)
         return total
+
+    def _count_suit_distribution(self, cards: List[str], major: str, level: str) -> Dict[str, int]:
+        counts = {"s": 0, "h": 0, "c": 0, "d": 0}
+        for card in cards:
+            suit = self._card_suit(card, major, level)
+            if suit and suit != "trump":
+                counts[suit] = counts.get(suit, 0) + 1
+        return counts
 
     def _card_strength(self, card: str, major: str, level: str) -> int:
         if card == "Jo":
@@ -433,15 +444,18 @@ class RuleBasedModel(nn.Module):
         context["trump_drag_mode"] = drag_mode
         trump_opts = self._filter_pair_leads_by_stage(trump_opts, context)
         off_opts = self._filter_pair_leads_by_stage(off_opts, context)
+        off_opts = self._filter_small_leads(off_opts, context)
 
         safe_leads = self._prepare_safe_leads(off_opts, context)
         point_leads = self._prepare_point_dump_candidates(off_opts, context)
+        shed_leads = self._prepare_void_shedding_leads(off_opts, context)
         decision = self._evaluate_lead_decision(
             context=context,
             trump_opts=trump_opts,
             off_opts=off_opts,
             safe_leads=safe_leads,
             point_leads=point_leads,
+            void_leads=shed_leads,
             want_trump=want_trump,
         )
         if decision:
@@ -983,6 +997,66 @@ class RuleBasedModel(nn.Module):
         safe = self._refine_options(safe, context, priority="lead-safe")
         return safe
 
+    def _prepare_void_shedding_leads(self, options: List[Dict[str, Any]], context: Dict[str, Any]) -> List[Dict[str, Any]]:
+        if not options:
+            return []
+        if context.get("meta", {}).get("lead_trump", False):
+            return []
+        if context.get("hand_trump_count", 0) >= 6:
+            return []
+        suit_counts = context.get("hand_suit_counts") or {}
+        candidates = [opt for opt in options if self._is_void_shedding_candidate(opt, suit_counts, context)]
+        if not candidates:
+            return []
+        return self._refine_options(candidates, context, priority="lead-void")
+
+    def _is_void_shedding_candidate(self, option: Dict[str, Any], suit_counts: Dict[str, int], context: Dict[str, Any]) -> bool:
+        if option.get("is_trump"):
+            return False
+        if option.get("contains_points"):
+            return False
+        if option.get("length") != 1:
+            return False
+        suit = option.get("primary_suit")
+        if not suit or suit == "trump":
+            return False
+        if suit_counts.get(suit, 0) != 1:
+            return False
+        rank_value = option.get("max_strength", -math.inf)
+        if rank_value >= RANK_ORDER.get("K", 11):
+            return False
+        if context.get("score_state") == "leading":
+            return True
+        return context.get("hand_trump_count", 0) <= 4
+
+    def _filter_small_leads(self, options: List[Dict[str, Any]], context: Dict[str, Any]) -> List[Dict[str, Any]]:
+        if not options:
+            return []
+        filtered: List[Dict[str, Any]] = []
+        blocked: List[Dict[str, Any]] = []
+        for opt in options:
+            if self._should_block_small_lead(opt, context):
+                blocked.append(opt)
+            else:
+                filtered.append(opt)
+        return filtered if filtered else options
+
+    def _should_block_small_lead(self, option: Dict[str, Any], context: Dict[str, Any]) -> bool:
+        if option.get("is_trump"):
+            return False
+        if option.get("contains_points"):
+            return False
+        if option.get("length") != 1:
+            return False
+        suit = option.get("primary_suit")
+        if not suit or suit == "trump":
+            return False
+        suit_counts = context.get("hand_suit_counts") or {}
+        if suit_counts.get(suit, 0) <= 1:
+            return False
+        rank_value = option.get("max_strength", -math.inf)
+        return rank_value < RANK_ORDER[SAFE_LEAD_MIN_RANK]
+
     def _determine_trump_drag_mode(self, context: Dict[str, Any], want_trump: bool) -> str:
         if context.get("no_trump_mark"):
             return "none"
@@ -1283,6 +1357,7 @@ class RuleBasedModel(nn.Module):
         off_opts: List[Dict[str, Any]],
         safe_leads: List[Dict[str, Any]],
         point_leads: List[Dict[str, Any]],
+        void_leads: List[Dict[str, Any]],
         want_trump: bool,
     ) -> Optional[Tuple[str, int]]:
         if want_trump and trump_opts:
@@ -1290,6 +1365,9 @@ class RuleBasedModel(nn.Module):
 
         if point_leads and self._should_stick_on_lead(context, want_trump):
             return "stick", self._select_point_dump(point_leads)
+
+        if not want_trump and void_leads:
+            return "follow_small", self._select_offensive_lead(void_leads)
 
         if safe_leads:
             return "follow_small", self._select_offensive_lead(safe_leads)
