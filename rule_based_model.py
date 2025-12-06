@@ -12,6 +12,9 @@ RANK_ORDER = {rank: idx for idx, rank in enumerate(["2", "3", "4", "5", "6", "7"
 EARLY_CARD_LIMIT = 20
 MID_CARD_LIMIT = 70
 BIG_TRUMP_STRENGTH = 950
+TRUMP_TOTAL_ESTIMATE = 24
+ASSERTIVE_MIN_RANK = "J"
+LIGHT_MIN_RANK = "7"
 
 
 class RuleBasedModel(nn.Module):
@@ -82,6 +85,11 @@ class RuleBasedModel(nn.Module):
         total_points_played = self._total_points_played(played_cards)
         hand_trump_count = sum(1 for card in deck_cards if self._is_trump(card, major_suit, level_rank))
         lead_suit = self._lead_suit_from_history(history_moves, major_suit, level_rank)
+        trump_drag_rounds = self._estimate_trump_drag_rounds(played_piles, history_moves, major_suit, level_rank)
+        seen_trump_cards = played_cards + history_cards_flat
+        total_trump_seen = self._count_trump_cards(seen_trump_cards, major_suit, level_rank)
+        high_trump_seen = self._count_high_trump_seen(seen_trump_cards, major_suit, level_rank)
+        trump_remaining_estimate = max(0, TRUMP_TOTAL_ESTIMATE - total_trump_seen)
         role = self._infer_role(meta)
         score_state = self._infer_score_state(meta)
         void_map = self._normalize_void_map(meta)
@@ -113,6 +121,12 @@ class RuleBasedModel(nn.Module):
             "lead_suit": lead_suit,
             "hand_trump_count": hand_trump_count,
             "trump_status": self._classify_trump_status(hand_trump_count),
+            "trump_drag_rounds": trump_drag_rounds,
+            "trump_remaining_estimate": trump_remaining_estimate,
+            "trump_half_spent": trump_remaining_estimate <= TRUMP_TOTAL_ESTIMATE / 2,
+            "trump_low_rounds_left": trump_remaining_estimate <= 8,
+            "high_trump_seen": high_trump_seen,
+            "no_trump_mark": hand_trump_count == 0,
         }
         context["teammate_flags"] = self._build_teammate_flags(context)
         context["teammate_void_suits"], context["enemy_void_suits"] = self._split_void_map(context)
@@ -341,6 +355,18 @@ class RuleBasedModel(nn.Module):
         if position_info.get("is_last") and points_on_table > 0:
             need_takeover = True
 
+        force_take_override = False
+        teammate_trump_push = self._teammate_trump_lead_pressure(context)
+        if teammate_trump_push and winning:
+            need_takeover = True
+            force_take_override = True
+        special_takeover = self._should_force_special_takeover(context, winning)
+        if special_takeover:
+            need_takeover = True
+            force_take_override = True
+        if self._should_take_on_strength(context, winning, opponent_winning):
+            need_takeover = True
+
         dump_candidates = self._prepare_point_dump_candidates(fillers, context)
         safe_options = self._prepare_safe_fillers(fillers, context)
         decision = self._evaluate_follow_decision(
@@ -353,6 +379,7 @@ class RuleBasedModel(nn.Module):
             teammate_winning=teammate_winning,
             opponent_winning=opponent_winning,
             current_best=current_best,
+            force_take_override=force_take_override,
         )
         if decision:
             decision_type, choice = decision
@@ -391,6 +418,8 @@ class RuleBasedModel(nn.Module):
         if trump_status == "disadvantage" and not meta.get("lead_trump", False):
             want_trump = False
 
+        drag_mode = self._determine_trump_drag_mode(context, want_trump)
+
         trump_opts = [opt for opt in options if opt["is_trump"]]
         off_opts = [opt for opt in options if not opt["is_trump"]]
         trump_opts = self._prioritize_pair_release(trump_opts, context)
@@ -400,6 +429,10 @@ class RuleBasedModel(nn.Module):
         trump_opts = self._refine_options(trump_opts, context, priority="lead-trump")
         off_opts = self._refine_options(off_opts, context, priority="lead-off")
         trump_opts = self._filter_trump_overkill(trump_opts, context, is_lead=True)
+        trump_opts = self._filter_trump_leads_by_mode(trump_opts, context, drag_mode)
+        context["trump_drag_mode"] = drag_mode
+        trump_opts = self._filter_pair_leads_by_stage(trump_opts, context)
+        off_opts = self._filter_pair_leads_by_stage(off_opts, context)
 
         safe_leads = self._prepare_safe_leads(off_opts, context)
         point_leads = self._prepare_point_dump_candidates(off_opts, context)
@@ -901,6 +934,37 @@ class RuleBasedModel(nn.Module):
             return True
         return False
 
+    def _estimate_trump_drag_rounds(
+        self,
+        played_piles: List[List[str]],
+        history: List[List[str]],
+        major: str,
+        level: str,
+    ) -> int:
+        rounds = 0
+        for pile in played_piles:
+            if not pile:
+                continue
+            if self._card_suit(pile[0], major, level) == "trump":
+                rounds += 1
+        if history and history[0]:
+            if self._card_suit(history[0][0], major, level) == "trump":
+                rounds += 1
+        return rounds
+
+    def _count_trump_cards(self, cards: List[str], major: str, level: str) -> int:
+        return sum(1 for card in cards if self._is_trump(card, major, level))
+
+    def _count_high_trump_seen(self, cards: List[str], major: str, level: str) -> int:
+        return sum(1 for card in cards if self._is_high_trump(card, major, level))
+
+    def _is_high_trump(self, card: str, major: str, level: str) -> bool:
+        if card in ("jo", "Jo"):
+            return True
+        if len(card) != 2:
+            return False
+        return card[1] == level
+
     def _prepare_safe_fillers(self, options: List[Dict[str, Any]], context: Dict[str, Any]) -> List[Dict[str, Any]]:
         if not options:
             return []
@@ -918,6 +982,92 @@ class RuleBasedModel(nn.Module):
         safe = self._enforce_primary_constraints(safe, context, is_lead=True)
         safe = self._refine_options(safe, context, priority="lead-safe")
         return safe
+
+    def _determine_trump_drag_mode(self, context: Dict[str, Any], want_trump: bool) -> str:
+        if context.get("no_trump_mark"):
+            return "none"
+        rounds = context.get("trump_drag_rounds", 0)
+        half_spent = context.get("trump_half_spent", False)
+        low_rounds = context.get("trump_low_rounds_left", False)
+        high_seen = context.get("high_trump_seen", 0)
+        if want_trump and rounds < 2:
+            return "assertive"
+        if want_trump and not half_spent:
+            return "assertive"
+        if rounds > 5 and high_seen >= 4:
+            return "light"
+        if low_rounds or half_spent:
+            return "light"
+        return "free"
+
+    def _filter_trump_leads_by_mode(
+        self,
+        options: List[Dict[str, Any]],
+        context: Dict[str, Any],
+        mode: str,
+    ) -> List[Dict[str, Any]]:
+        if not options or mode in {"none", "free"}:
+            return options
+        major = context.get("major", "s")
+        level = context.get("level", "2")
+        filtered: List[Dict[str, Any]] = []
+        for opt in options:
+            if not opt.get("is_trump"):
+                filtered.append(opt)
+                continue
+            if mode == "assertive":
+                if self._contains_joker(opt):
+                    continue
+                if not opt.get("is_pair") and self._option_min_rank_value(opt, major, level) < RANK_ORDER[ASSERTIVE_MIN_RANK]:
+                    continue
+            if mode == "light":
+                if not opt.get("is_pair") and self._option_min_rank_value(opt, major, level) < RANK_ORDER[LIGHT_MIN_RANK]:
+                    continue
+            filtered.append(opt)
+        return filtered if filtered else options
+
+    def _contains_joker(self, option: Dict[str, Any]) -> bool:
+        return any(card in ("jo", "Jo") for card in option.get("cards", []))
+
+    def _option_min_rank_value(self, option: Dict[str, Any], major: str, level: str) -> int:
+        min_value = math.inf
+        for card in option.get("cards", []):
+            if card in ("jo", "Jo"):
+                min_value = min(min_value, 1000)
+                continue
+            if len(card) != 2:
+                continue
+            if self._is_trump(card, major, level):
+                min_value = min(min_value, RANK_ORDER.get(card[1], -1))
+        return min_value if min_value != math.inf else -1
+
+    def _filter_pair_leads_by_stage(self, options: List[Dict[str, Any]], context: Dict[str, Any]) -> List[Dict[str, Any]]:
+        if not options:
+            return []
+        position = context.get("position_info", {})
+        if position.get("is_last"):
+            return options
+        stage = context.get("stage", "early")
+        filtered: List[Dict[str, Any]] = []
+        for opt in options:
+            if not self._is_pair_lead_blocked(opt, stage):
+                filtered.append(opt)
+        return filtered if filtered else options
+
+    def _is_pair_lead_blocked(self, option: Dict[str, Any], stage: str) -> bool:
+        if not option.get("is_pair"):
+            return False
+        rank = option.get("pair_rank")
+        if rank is None:
+            return False
+        rank_value = RANK_ORDER.get(rank, -1)
+        five_value = RANK_ORDER["5"]
+        ten_value = RANK_ORDER["0"]
+        if rank_value < five_value:
+            return True
+        if stage == "early" and rank_value < ten_value:
+            return True
+        return False
 
     def _apply_trump_takeover_filters(self, options: List[Dict[str, Any]], context: Dict[str, Any]) -> List[Dict[str, Any]]:
         if not options:
@@ -967,6 +1117,114 @@ class RuleBasedModel(nn.Module):
             minimal = False
         return minimal
 
+    def _teammate_trump_lead_pressure(self, context: Dict[str, Any]) -> bool:
+        order = context.get("current_trick_order") or []
+        history = context.get("history") or []
+        teammate_id = context.get("teammate_id")
+        if not order or not history or teammate_id is None:
+            return False
+        if order[0] != teammate_id:
+            return False
+        lead_move = history[0]
+        if not lead_move:
+            return False
+        if not self._is_normal_trump_play(lead_move, context):
+            return False
+        position_info = context.get("position_info", {})
+        if position_info.get("turn_index") != 2:
+            return False
+        return context.get("hand_trump_count", 0) > 5
+
+    def _is_normal_trump_play(self, cards: List[str], context: Dict[str, Any]) -> bool:
+        major = context.get("major", "s")
+        level = context.get("level", "2")
+        for card in cards:
+            if card in ("jo", "Jo"):
+                return False
+            if len(card) == 2 and card[1] == level:
+                return False
+            if not self._is_trump(card, major, level):
+                return False
+        return True
+
+    def _should_take_on_strength(
+        self,
+        context: Dict[str, Any],
+        winning: List[Dict[str, Any]],
+        opponent_winning: bool,
+    ) -> bool:
+        if not winning or not opponent_winning:
+            return False
+        stage = context.get("stage", "early")
+        if stage == "late":
+            return False
+        if context.get("points_on_table", 0) > 20:
+            return False
+        threshold = self._takeover_strength_threshold(context)
+        best_strength = max(opt.get("max_strength", -math.inf) for opt in winning)
+        return best_strength >= threshold
+
+    def _takeover_strength_threshold(self, context: Dict[str, Any]) -> float:
+        lead_suit = context.get("lead_suit")
+        if lead_suit == "trump":
+            return RANK_ORDER["J"] + 120  # roughly weaker trump strength
+        return RANK_ORDER["A"]
+
+    def _should_force_special_takeover(self, context: Dict[str, Any], winning: List[Dict[str, Any]]) -> bool:
+        if not winning:
+            return False
+        stage = context.get("stage", "early")
+        specials = [opt for opt in winning if self._is_special_take_option(opt, context, stage)]
+        if not specials:
+            return False
+        if self._teammate_led_high_guard(context):
+            return False
+        return True
+
+    def _is_special_take_option(self, option: Dict[str, Any], context: Dict[str, Any], stage: str) -> bool:
+        length = option.get("length", 0)
+        cards = option.get("cards", [])
+        level = context.get("level", "2")
+        if length >= 4:
+            return True
+        if length == 2 and set(cards) == {"jo", "Jo"}:
+            return stage != "early"
+        if option.get("is_pair"):
+            rank = option.get("pair_rank")
+            if rank in {"A", level}:
+                return True
+        return False
+
+    def _teammate_led_high_guard(self, context: Dict[str, Any]) -> bool:
+        order = context.get("current_trick_order") or []
+        history = context.get("history") or []
+        teammate_id = context.get("teammate_id")
+        if not order or not history or teammate_id is None:
+            return False
+        if order[0] != teammate_id:
+            return False
+        lead_move = history[0]
+        if not lead_move:
+            return False
+        major = context.get("major", "s")
+        level = context.get("level", "2")
+        ranks = [card[1] for card in lead_move if isinstance(card, str) and len(card) == 2]
+        if ranks.count("A") >= 2:
+            return True
+        return any(self._is_guard_card(card, major, level) for card in lead_move)
+
+    def _is_guard_card(self, card: str, major: str, level: str) -> bool:
+        if card in ("jo", "Jo"):
+            return True
+        if len(card) != 2:
+            return False
+        suit, rank = card[0], card[1]
+        if rank == level:
+            return True
+        if rank == "A" and suit == major:
+            return True
+        return False
+
     def _evaluate_follow_decision(
         self,
         context: Dict[str, Any],
@@ -978,8 +1236,11 @@ class RuleBasedModel(nn.Module):
         teammate_winning: bool,
         opponent_winning: bool,
         current_best: Optional[Dict[str, Any]],
+        force_take_override: bool = False,
     ) -> Optional[Tuple[str, int]]:
         minimal_control = self._needs_minimal_control(context)
+        if force_take_override:
+            teammate_winning = False
         if winning and (need_takeover or self._should_force_future_control(context, winning)):
             prefer_preserve = need_takeover and not context.get("meta", {}).get("apply_pressure", False)
             return "control", self._select_winning_option(
