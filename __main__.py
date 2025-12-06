@@ -1,6 +1,7 @@
 import json
 import os
 from data.model import CNNModel
+from data.rule_based_model import RuleBasedModel
 import torch
 from data.wrapper import cardWrapper
 from data.mvGen import move_generator
@@ -15,6 +16,13 @@ Major = ['jo', 'Jo']
 pointorder = ['2','3','4','5','6','7','8','9','0','J','Q','K','A']
 PLAYER_ID_KEYS = ("player", "player_id", "playerID", "self", "self_id", "seat_id")
 SELF_PLAYER_ID = None
+POINT_CARD_VALUES = {"5": 5, "0": 10, "K": 10}
+GAME_MEMORY = {
+    "kitty_points": 0,
+    "kitty_high_risk": False,
+    "void_map": {i: set() for i in range(4)},
+    "processed_tricks": set(),
+}
 
 
 def maybe_update_self_player(container):
@@ -123,6 +131,139 @@ def Poker2Num_seq(pokers, deck):
         id_seq.append(card_id)
         deck_copy.remove(card_id)
     return id_seq
+
+
+def _card_points_from_name(name):
+    if isinstance(name, str) and len(name) == 2:
+        return POINT_CARD_VALUES.get(name[1], 0)
+    return 0
+
+
+def _sum_points_from_entries(entries):
+    total = 0
+    if not entries:
+        return total
+    for move in entries:
+        for card in move:
+            total += _card_points_from_name(Num2Poker(card))
+    return total
+
+
+def _suit_category(name, major, level):
+    if name in ("jo", "Jo"):
+        return "trump"
+    if not isinstance(name, str) or len(name) != 2:
+        return None
+    suit, rank = name[0], name[1]
+    if rank == level:
+        return "trump"
+    if major != 'n' and suit == major:
+        return "trump"
+    return suit
+
+
+def _trick_signature(entries, leader):
+    if not entries or leader is None:
+        return None
+    normalized = tuple(tuple(move) for move in entries)
+    return (leader % 4, normalized)
+
+
+def _update_kitty_memory(card_ids):
+    points = sum(_card_points_from_name(Num2Poker(card)) for card in card_ids)
+    GAME_MEMORY["kitty_points"] = points
+    GAME_MEMORY["kitty_high_risk"] = points > 10
+
+
+def _update_void_memory(entries, leader, level, major):
+    if not entries or leader is None:
+        return
+    lead_cards = entries[0]
+    if not lead_cards:
+        return
+    lead_name = Num2Poker(lead_cards[0])
+    lead_suit = _suit_category(lead_name, major, level)
+    if lead_suit in (None, "trump"):
+        return
+    for offset, move in enumerate(entries):
+        seat = (leader + offset) % 4
+        if not move:
+            continue
+        names = [Num2Poker(card) for card in move]
+        if any(_suit_category(name, major, level) == lead_suit for name in names):
+            continue
+        GAME_MEMORY["void_map"].setdefault(seat, set()).add(lead_suit)
+
+
+def _register_history_segments(history_struct, level, major):
+    if not history_struct or len(history_struct) < 3:
+        return
+    finished = history_struct[0]
+    leader = history_struct[2]
+    signature = _trick_signature(finished, leader)
+    if signature and signature not in GAME_MEMORY["processed_tricks"]:
+        _update_void_memory(finished, leader, level, major)
+        GAME_MEMORY["processed_tricks"].add(signature)
+
+
+def _infer_score_state(global_info, banker_id, self_id):
+    if not isinstance(global_info, dict):
+        return "balanced", 0
+    raw_score = (
+        global_info.get("score")
+        or global_info.get("scores")
+        or global_info.get("score_board")
+        or global_info.get("scoreboard")
+    )
+    attack_points = None
+    defend_points = None
+    if isinstance(raw_score, dict):
+        attack_candidates = ["attack", "attacker", "bank", "banker", "offense", "lead"]
+        defend_candidates = ["defense", "defender", "farmer", "farm", "opponent", "follow"]
+        for key in attack_candidates:
+            if key in raw_score:
+                attack_points = raw_score[key]
+                break
+        for key in defend_candidates:
+            if key in raw_score:
+                defend_points = raw_score[key]
+                break
+    elif isinstance(raw_score, (list, tuple)) and len(raw_score) >= 2:
+        attack_points, defend_points = raw_score[0], raw_score[1]
+    if attack_points is None or defend_points is None or banker_id is None or banker_id < 0:
+        return "balanced", 0
+    banker_side = {banker_id % 4, (banker_id + 2) % 4}
+    if self_id in banker_side:
+        margin = (attack_points or 0) - (defend_points or 0)
+    else:
+        margin = (defend_points or 0) - (attack_points or 0)
+    if margin >= 20:
+        return "leading", margin
+    if margin <= -20:
+        return "trailing", margin
+    return "balanced", margin
+
+def _build_rule_meta(curr_request, history_struct, leader, selfid, hold_size):
+    banker = curr_request["global"]["banking"].get("banker", -1)
+    score_state, score_margin = _infer_score_state(curr_request["global"], banker, selfid)
+    history = history_struct[1]
+    trick_order = [(leader + idx) % 4 for idx in range(len(history))]
+    meta = {
+        "player_id": selfid,
+        "banker_id": banker,
+        "is_banker": banker == selfid,
+        "teammate_id": (selfid + 2) % 4,
+        "score_state": score_state,
+        "score_margin": score_margin,
+        "current_trick_order": trick_order,
+        "current_trick_leader": leader,
+        "void_map": {seat: sorted(list(suits)) for seat, suits in GAME_MEMORY["void_map"].items()},
+        "kitty_points": GAME_MEMORY["kitty_points"],
+        "kitty_high_risk": GAME_MEMORY["kitty_high_risk"],
+        "remaining_cards": hold_size,
+        "last_completed_points": _sum_points_from_entries(history_struct[0]),
+    }
+    return meta
     
 def checkPokerType(poker, level): #poker: list[int]
     poker = [Num2Poker(p) for p in poker]
@@ -212,19 +353,23 @@ def cover_Pub(old_public, deck, level, major):
     bury_count = len(old_public)
     selected = select_kitty_cards(full_hand, level, major, bury_count)
     # selected is a list of card ids to discard; remove them from hand
+    _update_kitty_memory(selected)
     remaining = list(full_hand)
     for card in selected:
         if card in remaining:
             remaining.remove(card)
     return selected
 
-def playCard(history, hold, played, level, wrapper, mv_gen, model):
+def playCard(curr_request, hold, played, level, major, wrapper, mv_gen, model, selfid):
     """
-    history: 当前这一轮（局部）历史，来自 Botzone 的 curr_request["history"][1]
+    curr_request: Botzone 对局请求（含完整 history/global 信息）
     hold:    自己当前手牌（Botzone 牌 id 列表）
     played:  四家已经打出的牌（id 列表的列表）
     level:   级牌点数（如 '2', '3', ...）
     """
+    history_struct = curr_request["history"]
+    history = history_struct[1]
+    leader = history_struct[3]
 
     # 1. 构造 obs（注意这里用的是牌名）
     obs = {
@@ -245,12 +390,18 @@ def playCard(history, hold, played, level, wrapper, mv_gen, model):
     obs_mat, action_mask = wrapper.obsWrap(obs, action_options)
 
     # 4. 组装模型输入
+    meta = None
+    if isinstance(model, RuleBasedModel):
+        meta = _build_rule_meta(curr_request, history_struct, leader, selfid, len(hold))
+
     state = {
         "observation": torch.tensor(obs_mat, dtype=torch.float32).unsqueeze(0),   # (1, 128, 4, 14)
         "action_mask": torch.tensor(action_mask, dtype=torch.float32).unsqueeze(0),  # (1, 54)
         # Botzone 这里只在“出牌阶段”调用，所以直接用 PLAY = 2 对应的 head
         "stage": torch.tensor([2], dtype=torch.long),  # (1,)
     }
+    if meta is not None:
+        state["meta"] = meta
 
     # 5. 调模型选一个 action index
     action_idx = obs2action(model, state)
@@ -308,9 +459,12 @@ else:
 maybe_update_self_player(full_input)
 
 # loading model
-model = CNNModel()
-data_dir = '/data/tractor_model.pt' # to be modified
-model.load_state_dict(torch.load(data_dir, map_location = torch.device('cpu')))
+
+model = RuleBasedModel()
+
+# model = CNNModel()
+# data_dir = '/data/tractor_model.pt' # to be modified
+# model.load_state_dict(torch.load(data_dir, map_location = torch.device('cpu')))
 
 hold = []
 played = [[], [], [], []]
@@ -328,6 +482,10 @@ for i in range(len(full_input["requests"])-1):
         history = req["history"]
         selfid = (history[3] + len(history[1])) % 4
         maybe_update_self_player({"player": selfid})
+        level_req = req["global"].get("level") if "global" in req else None
+        major_req = req["global"].get("banking", {}).get("major") if "global" in req else None
+        if level_req and major_req is not None:
+            _register_history_segments(history, level_req, major_req)
         if len(history[0]) != 0:
             self_move = history[0][(selfid-history[2]) % 4]
             #print(hold)
@@ -361,6 +519,8 @@ elif curr_request["stage"] == "play":
     mv_gen = move_generator(level, major)
     
     history = curr_request["history"]
+    _register_history_segments(history, level, major)
+
     selfid = (history[3] + len(history[1])) % 4
     maybe_update_self_player({"player": selfid})
     if len(history[0]) != 0:
@@ -375,7 +535,7 @@ elif curr_request["stage"] == "play":
             played[(history[3]+player_rec) % 4].extend(history[1][player_rec])
     history_curr = history[1]
     
-    response = playCard(history_curr, hold, played, level, card_wrapper, mv_gen, model)
+    response = playCard(curr_request, hold, played, level, major, card_wrapper, mv_gen, model, selfid)
 
 print(json.dumps({
     "response": response
