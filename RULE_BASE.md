@@ -1,113 +1,99 @@
-# RULE_BASE 行动手册
+# RULE_BASE 行动手册（2025 重构）
 
-本文档汇总当前 rule-based 模型在对局中的核心规则，实现可解释的 3 种行动类别以及 2 (优势/劣势) × 3 (早/中/晚期) × 2 (庄/闲) 的 12 维度领牌逻辑。
+本版行动手册描述全新的庄/闲拆分策略：
 
-## 三大行动类别
+- **阶段性 restrict**：早/中/晚期直接作用于行动集，先剪枝再决策；
+- **局面估值**：通过手牌、得分、阶段以及特殊牌型 bonus 给出优势/平衡/劣势标签；
+- **领牌双分叉**：庄/闲分别在“优势/劣势”与“主/副牌偏好”两个维度上选择策略；
+- **跟牌三大行动类别**：管牌、贴分、跟小牌，由墩上归属 + 座位索引驱动，并附带微观过滤器确保合法、经济。
 
-### 1. 控盘 / 管排 (`control`)
-- 触发场景：抢在对手前领先、需要强行接管、或主动领主。代码路径：`_lead_policy` / `_select_trump_lead`、`_select_winning_option`。
-- 关键信号：
-  - `want_trump=True`（根据手中主牌、身份、优势判断）。
-  - `_needs_minimal_control` 为真时尽量用最小成本（例如末家但台面有分）。
-  - `force_take_override`、`_should_force_special_takeover`、`_should_force_future_control` 等逻辑强制接管。
-- 行动特点：优先选择长度长、强度高的同花结构；若敌方花色已绝门则放宽强度要求；若主牌劣势则避免无谓主拖。
+## 阶段性 restrict 与先验约束
 
-### 2. 跟小牌 (`follow_small`)
-- 触发场景：既不需要管排，也没有贴分需求。
-- 主要来源：
-  - `safe_leads` / `safe_options`（无分且可拆 pair 的安全选项）。
-  - `_filter_small_leads` 阻止无意义的小单张；`_prepare_void_shedding_leads` 放行“单张+近绝门”的弃牌。
-  - 跟牌阶段使用 `_select_smallest`、`_select_low_risk_filler`，带有“非 5 分优先”逻辑。
-- 行动特点：尽力释放无分牌、拆掉危险对子，同时遵守主花色/配对约束。
-
-### 3. 贴分 (`stick`)
-- 触发场景：
-  - 队友已经赢墩 (`teammate_winning`) 且手里有 5/10/K。
-  - 领牌但 `score_state` 领先且 `want_trump=False`，允许主动倒分。
-  - 对手当前赢墩但判断其并非绝对最大（70% 随机 “小赌” 行为）。
-- 关键策略：贴分前会检查 `_prepare_point_dump_candidates`，优先包含 10/K；若只剩 5 分则启用 70% 概率逻辑。
-
-## 状态轴判定
-
-| 维度 | 判定方法 | 影响点 |
+| 阶段 | 约束要点 | 目标 |
 | --- | --- | --- |
-| 主牌优势 (`advantage` / `disadvantage`) | `_classify_trump_status`: 手牌主牌数量 >9 视为优势，<9 为劣势，其余为平衡。 | 决定 `want_trump`、`_determine_trump_drag_mode`、是否保守 trump。 |
-| 阶段 (`early` / `mid` / `late`) | `_classify_game_stage`: 已知牌张数 ≤20 早期，≤70 中期，其余晚期。 | 控制 pair 领出、分牌优先级、拖主模式、得分倾向。 |
-| 身份 (`role`) | `_infer_role` 区分庄家/闲家。 | 决定主攻/防守倾向、是否要保护底牌、是否更愿意抢主。 |
+| 早期 (`cards_seen ≤ 20`) | 禁止 Joker 与级牌对子领出；副牌需保持原顺位。 | 隐藏杀手锏、避免早暴露底牌。 |
+| 中期 (`20 < cards_seen ≤ 70`) | `_bias_off_suit_release` 将短门副牌排在高优先级；适度放开对子。 | 逐步释放副牌、为后期制造 void。 |
+| 晚期 (`cards_seen > 70`) | 允许大部分组合，但 `_apply_micro_lead_filters` 自动保护剩余顶主。 | 进入收官，控制节奏并预留最后护主。 |
 
-## 12 维领牌策略矩阵
-下表描述在不同阶段 + 身份 + 主牌状态下的默认领牌思路。默认假设 `score_state` 中性，如有领先/落后会进一步在 `_contextual_score` 中微调（例如领先更倾向贴分）。
+## 局面估值 (`_compute_position_valuation`)
 
-### 早期 (≤20 张牌已见)
+1. **默认勇敢**：基础值 `1.0` + 早期额外 `+0.2`，确保开局无论庄家或闲家都被视为“优势”，敢于主动出牌。
+2. **低值才触发保护**：当综合得分低于 `0.85` 时才落入“劣势”，才会启动保守策略；高于 `1.15` 认定为“优势”。
+3. **信息来源**：
+   - **手牌强度**：截取前 8 张按 `_card_strength` 取均值，并考虑主牌密度（庄家权重更高）。
+   - **得分 + 阶段**：领先/落后状态、`score_margin`、以及“晚期仍低于 40 分”的惩罚；早期若已拿到 >20 分还会加成，符合“前期 >20 视为小优势”。
+   - **特殊牌型 bonus**：双王、等级对等 premium 组合会额外 +0.1~0.2，确保拥有杀手锏时依旧视为优势。
+4. **计划偏好 (`plan_bias`)**：根据 trump 密度、最短副牌长度与阶段推导出 `trump / offsuit / balanced`，驱动领牌第二层分叉。
 
-#### 庄家 · 优势
-- 目的：建立主花色统治，保护底牌。
-- 行为：`want_trump=True`，`_determine_trump_drag_mode` 常进入 `assertive`；`_filter_trump_leads_by_mode` 允许 11 以上的强主，禁止双王/级牌过度拖。
-- 配合：`_filter_pair_leads_by_stage` 阻止中小对牌领出，优先长主或大副牌 tractors。
+## 领牌策略（庄上 / 闲家）
 
-#### 庄家 · 劣势
-- 目的：稳住牌权，不暴露主。
-- 行为：`want_trump=False`（除非 `meta.lead_trump` 强制），`_filter_small_leads` 让出安全副牌；当 suit 只剩 1 张时靠 `_prepare_void_shedding_leads` 尽早绝门为队友创造杀主机会。
-- 配合：大主被 `SAFE_LEAD_MIN_RANK` 和 `_should_preserve_big_trump` 保护，避免早期亏本拖主。
+决策顺序：先看估值 `state ∈ {advantage, balanced, disadvantage}`，再看 `plan_bias ∈ {trump, offsuit, balanced}`，最终在 bucket 序列里选第一套可行动集。
 
-#### 闲家 · 优势
-- 目的：配合队友快速拖主、寻找得分窗口。
-- 行为：若主牌≥阈值，`want_trump=True`；但 `_filter_trump_overkill` 防止盲目双王领出。优先处理非分副牌，避免给庄家见底。
-- 配合：若侦测到队友 void，`_contextual_score` 会奖励继续打该花，便于贴分给队友。
+### 庄家
 
-#### 闲家 · 劣势
-- 目的：拖延、找准贴分时机。
-- 行为：`want_trump=False`，优先释放安全副牌；当敌方花色绝门时 `_needs_minimal_control=False`，避免抢主。
-- 配合：`_prepare_safe_leads` 会按非分、可拆对子优先；若只剩 1 张某花且无分，则立即用 void-shedding。
+- **优势 + 主牌偏好**：`[trump_control → points → void → safe → off_balance → minimal_trump]`。早期多张主直接控盘，若仍有分则切入贴分 bucket。
+- **优势 + 副牌偏好**：`[void → safe → points → off_balance → trump_control → minimal_trump]`。主牌暂存，优先甩单张短门制造 void。
+- **劣势**：`[safe → points → off_balance → minimal_trump → void → trump_control]`，强调保身，只有当安全牌耗尽才用最小主接牌。
 
-### 中期 (21–70 张牌)
+### 闲家
 
-#### 庄家 · 优势
-- 目的：筛掉敌方剩余主、为收尾铺垫。
-- 行为：`drag_mode` 可能转为 `free`；允许更长的主拖，但 `_should_preserve_big_trump` 仍保护顶牌。若 `score_state leading`，在 `safe_leads` 耗尽后允许点数贴分。
-- 配合：`_filter_pair_leads_by_stage` 逐渐放宽，允许 10 以上对牌领出。
+- **优势 + 主牌偏好**：`[trump_control → off_balance → points → safe → void → minimal_trump]`，必要时协助队友拉主。
+- **优势 + 副牌/平衡**：`[off_balance → void → points → safe → trump_control → minimal_trump]`，靠副牌取得信息后再视情况砸主。
+- **劣势**：`[safe → void → off_balance → minimal_trump → points → trump_control]`，尽量让队友来收，自己保存 trump。
 
-#### 庄家 · 劣势
-- 目的：找翻盘点，谨慎用主。
-- 行为：`want_trump` 仍多为 False；不过若对手拉开分差，`_should_force_special_takeover` 只在发现特殊牌型（双王、AA tractor）时才接管。
-- 配合：`_apply_trump_takeover_filters` 只有在台面>10 分或我方落后情况下才允许砸主救分。
+### 微观领牌过滤
+- 主 bucket (`trump_control`) 在晚期会自动丢弃大于 `BIG_TRUMP_STRENGTH` 的牌，除非没有其它 trump。
+- `points` bucket 仅允许单张 `10 > K > 5` 的顺序贴分。
+- `void/safe` bucket 会剔除带分牌，真正做到“副牌甩牌”优先。
 
-#### 闲家 · 优势
-- 目的：围剿庄家、扩大得分。
-- 行为：优先打敌方 void 花色，`_contextual_score` 在敌 void + 含分的情况下直接加分，促使贴 K/10；适度打主逼庄家交顶。
-- 配合：若队友 dump 过分，`teammate_flags.dumped_points` 提升继续贴分权重。
+## 跟牌策略：三大行动类别
 
-#### 闲家 · 劣势
-- 目的：保存 trump，伺机让队友切。
-- 行为：`_prepare_safe_leads` 居首，`void_leads` 仅在 trump ≤4 时触发，以免暴露短处；`_should_stick_against_opponent` 只有在判断对手非绝对最大且手里有 5 时才冒险。
-- 配合：若 `teammate_void` 已知，`_teammate_can_cut` 激活“贴分给队友砍”逻辑。
+### 1. 管牌（Control）
+- **触发**：队友未赢墩且存在可超越的组合。若台面有分则模式为“拿分式”，否则为“上台式”。
+- **座位逻辑**：
+  - **2 号位**（第二家）：除非台面分数 ≥ 阈值，否则会过滤掉最顶级 trump，优先保存实力。
+  - **3 号位**：被要求“不遗余力”，候选集按强度降序排序。
+  - **4 号位**：只取“能刚好压住”的最小牌，避免多余损耗。
+- **实现**：`_filter_control_candidates` + `_select_winning_option` 组合完成。
 
-### 晚期 (>70 张牌)
+### 2. 贴分（Stick）
+- **确定性贴分**：队友已赢墩时启用，严格执行 `10 > K > 5`，且只允许单张，确保不拆对子/tractor。
+- **试探式贴分**：仅 2 号位、且队友在自己之后时生效，只能给出单张 5 分并寄望队友回收。
 
-#### 庄家 · 优势
-- 目的：收官控分。
-- 行为：`_contextual_score` 对含分选项加 10；`_should_stick_on_lead` 常为真，即便不推主也会主动贴分锁分差。
-- 配合：`_filter_pair_leads_by_stage` 全面放开，对牌、tractor 皆可用来扫尾。
+### 3. 跟小牌（Follow Small）
+- **宏观滤器**：`safe_fillers → fillers`，优先无分单张、其次考虑近绝门的副牌。
+- **微观滤器**：通过 `MICRO_VALUE_ORDER (K > A > 10 > Q > J > 5 > 9 > 8 > …)` 控制相对大小；若场面已有 9，则 5 与 8 统统视为“过大”而被过滤，符合“5>8>7 不合法”的例子。
+- **绝门式贴牌**：当副牌仅剩 1 张且无分时，优先将其送出，为后手创造切牌机会。
 
-#### 庄家 · 劣势
-- 目的：孤注一掷抢回分。
-- 行为：若 `points_on_table=0` 且 `score_state trailing`，`_should_force_future_control` 会要求提前控牌，为尾盘强杀做准备；但 `_needs_minimal_control` 在敌方 void 情况下会关闭以避免白送。
-- 配合：`_select_winning_option` 在 `minimal=True` 时寻找 “够用即可” 的 trump 以节省资源。
+## 跟牌流程汇总
 
-#### 闲家 · 优势
-- 目的：安全落袋。
-- 行为：若 `want_trump=False`，先执行 void-shedding / safe lead，再贴分；若需要控盘，则优先使用剩余中等主（因为 `drag_mode` 多为 `light`）。
-- 配合：`_should_stick_with_teammate` 在晚期只要队友赢墩几乎必定贴分。
+1. `_build_follow_buckets` 划分 `control / stick_sure / stick_probe / small`。所有候选集合都先经过阶段性 restrict、对牌保护等宏观层。
+2. `_choose_follow_plan`：
+   - 若队友赢墩 → `stick_sure`；
+   - 若敌方赢且可赢 → `control`（points 或 stage）；
+   - 若自己为 2 号位且队友在后 → `stick_probe`；
+   - 否则默认 `small`。
+3. `_apply_micro_follow_filters` 套用座位逻辑、贴分排序及相对价值过滤，最后通过 `_select_follow_option` 输出。
 
-#### 闲家 · 劣势
-- 目的：最大化得分产出，寻找最后的砸主点。
-- 行为：当敌方花色绝门且我方 trump 仍有厚度时，`_needs_minimal_control=False`，允许直接控盘砸主；若 trump 稀少则依赖 void-shedding + 贴 5 分。
-- 配合：`_should_take_on_strength` 已被阶段逻辑限制，晚期除非卓越大牌不会再贸然接管，以免白送分。
+## Peer-Review 辅助信息
 
-## 额外守则
-- **Pair 领出限制**：`_filter_pair_leads_by_stage` 视阶段和对子点数控制低点 pair 的出现；早期 10 以下对牌禁领，中期 5 以下需已见到对应得分牌才放行。
-- **主拖模式**：`_determine_trump_drag_mode` 根据剩余主牌估算（见 `TRUMP_TOTAL_ESTIMATE`、`trump_drag_rounds`、`trump_half_spent` 等）动态切换 `assertive` / `light` / `free`，并在 `_filter_trump_leads_by_mode` 内过滤掉不符合节奏的主牌。
-- **无主标记**：当手牌无主 (`no_trump_mark`) 时直接禁止主动拖主，优先走副牌或 void-shedding。
-- **分牌优先级**：在领先或队友已 dump 的情况下，含分选项在 `_contextual_score` 会得到额外奖励，使 `stick` 更容易触发，反之若落后则权重下降。
+模型在 `_prepare_context` 阶段会“同行评审”手牌信息，推导多种信号：
 
-以上规则共同构成 rule-based 引擎的决策骨架，可据此快速理解或调整不同阶段、身份与主牌状态下的出牌倾向。
+- **void_map**：来自环境枚举的缺门集合，被拆成 `teammate_void_suits` 与 `enemy_void_suits`；
+- **teammate_flags**：记录队友是否跟到首牌、是否已经贴分、是否通过切牌暴露 trump；
+- **opponent_flags**：观察敌方是否丢分，以及“没有再见过该花色分牌”这类保守信号；
+- **point_visibility**：同花色的 10/5 是否已经摊牌，用于判断是否允许提前拆对子。
+
+这些信号会直接反馈到行动层：
+
+- **领牌防呆**：`_filter_peer_incompatible_leads` 会在微观过滤之后再次审查 action。凡是非主牌且花色属于 `teammate_void_suits` 的选项一律丢弃；若花色落在 `enemy_void_suits`，则只有“可控 A 级牌”或完全不带分的弃牌才保留，`points` bucket 则直接禁止避免“给敌人送分”。
+- **贴分刹车**：`stick_sure / stick_probe` 现在会检测 `enemy_void_suits`。一旦确认敌方缺门，哪怕满足贴分条件也会清空候选集，转而走 `control / small`，防止队友还没收分就被敌方切牌。
+- **继承性信号**：`teammate_flags` 中的 `void_suit`、`dumped_points` 会调整 `_contextual_score`，让后续轮次自觉规避同一花色的分牌输出。
+
+## 其他注意事项
+
+- **文档中的 bucket 名称** 与代码保持一致，便于排查：`trump_control / off_balance / void / safe / points / minimal_trump` 与 `control / stick_* / small`。
+- **估值信息透明**：`context["valuation"] = {score, state, plan_bias}` 可直接记录在日志，用于解释为何选择某一分支。
+- **高牌保留**：只有在晚期且 action bucket 被耗尽时，才允许动用剩余王与级牌，防止“底牌被掏空”的极端情况。
+
+以上框架保障了“庄上策略先行、庄闲分治、阶段先验→行动类别→微观 filter”这一完整决策链，也为后续扩展（如农民特化、记牌反馈）留出了钩子点。
