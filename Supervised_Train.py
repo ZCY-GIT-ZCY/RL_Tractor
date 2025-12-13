@@ -11,9 +11,11 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 VERBOSE = 1
 VERBOSE_BATCH = 100
 SAVE_FREQ_EPOCH = 2
-SAVE_PATH = "check_points/"
+# SAVE_PATH = "check_points/"
+SAVE_PATH = "rule-base_checkpoint/"
 
-SPLIT_DIR = f"Pre_trained_Data/splitted_npy"
+# SPLIT_DIR = f"Pre_trained_Data/splitted_npy"
+SPLIT_DIR = "Pre_trained_Data/rule_base_npy"
 OBS_PATH = os.path.join(SPLIT_DIR, "observation.npy")
 MASK_PATH = os.path.join(SPLIT_DIR, "action_mask.npy")
 LABEL_PATH = os.path.join(SPLIT_DIR, "action.npy")

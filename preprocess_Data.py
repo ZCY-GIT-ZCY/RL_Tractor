@@ -2,8 +2,10 @@
 import zipfile, os
 from pathlib import Path
 
-DATA_PATH = "Pre_trained_Data/Local_Data.npz"
-OUT_DIR = "Pre_trained_Data/splitted_npy"
+# DATA_PATH = "Pre_trained_Data/Local_Data.npz"
+DATA_PATH = "Pre_trained_Data/Rulebase_Data.npz"
+# OUT_DIR = "Pre_trained_Data/splitted_npy"
+OUT_DIR = "Pre_trained_Data/rule_base_npy"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 def stream_extract_npz(npz_path, out_dir):
