@@ -437,9 +437,15 @@ def obs2action(model, state):
     model.eval()
     with torch.no_grad():
         logits, value = model(state)  # logits 已经是 mask 之后的
-        # 这里可以采样，也可以贪心；我这里给你用贪心，稳定一点
-        action = torch.argmax(logits, dim=-1).item()
-    return action
+        mask = state["action_mask"][0]
+
+    valid_indices = [idx for idx, flag in enumerate(mask.tolist()) if flag > 0.5]
+    if not valid_indices:
+        return 0
+
+    filtered_logits = logits[0, valid_indices]
+    best_local = torch.argmax(filtered_logits).item()
+    return valid_indices[best_local]
 
 
 def action_intpt(action, deck):
@@ -460,11 +466,12 @@ maybe_update_self_player(full_input)
 
 # loading model
 
-model = RuleBasedModel()
+# model = RuleBasedModel()
 
-# model = CNNModel()
-# data_dir = '/data/tractor_model.pt' # to be modified
-# model.load_state_dict(torch.load(data_dir, map_location = torch.device('cpu')))
+model = CNNModel()
+data_dir = '/data/tractor_model.pt' # to be modified
+model.load_state_dict(torch.load(data_dir, map_location = torch.device('cpu')))
+model.eval()
 
 hold = []
 played = [[], [], [], []]

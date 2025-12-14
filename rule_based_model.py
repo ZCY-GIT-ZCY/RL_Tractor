@@ -26,6 +26,7 @@ STICK_PRIORITY = ("0", "K", "5")
 PEER_SAFE_LEAD_MIN_VALUE = RANK_ORDER["A"]
 SMALL_TRUMP_SIGNAL_THRESHOLD = BIG_TRUMP_STRENGTH - 150
 STRONG_OFFSUIT_PRESSURE = RANK_ORDER["Q"]
+CARD_DUPLICATES = 2
 
 
 class RuleBasedModel(nn.Module):
@@ -95,6 +96,7 @@ class RuleBasedModel(nn.Module):
 
         total_points_played = self._total_points_played(played_cards)
         hand_trump_count = sum(1 for card in deck_cards if self._is_trump(card, major_suit, level_rank))
+        joker_count = sum(1 for card in deck_cards if card in ("jo", "Jo"))
         lead_suit = self._lead_suit_from_history(history_moves, major_suit, level_rank)
         trump_drag_rounds = self._estimate_trump_drag_rounds(played_piles, history_moves, major_suit, level_rank)
         seen_trump_cards = played_cards + history_cards_flat
@@ -132,6 +134,7 @@ class RuleBasedModel(nn.Module):
             "last_completed_points": (meta or {}).get("last_completed_points", 0),
             "lead_suit": lead_suit,
             "hand_trump_count": hand_trump_count,
+            "joker_count": joker_count,
             "trump_status": self._classify_trump_status(hand_trump_count),
             "trump_drag_rounds": trump_drag_rounds,
             "trump_remaining_estimate": trump_remaining_estimate,
@@ -173,6 +176,7 @@ class RuleBasedModel(nn.Module):
         context["strong_peer_mark"] = self._resolve_strong_peer_mark(context)
         context["teammate_point_trump_lead"] = self._detect_teammate_point_trump_lead(context)
         context["should_force_trump_open"] = self._should_force_trump_open(context)
+        context["rank_tracker"] = self._build_unseen_rank_tracker(context)
         return context
 
     def _decode_sequence(self, block: Sequence[Sequence[Sequence[float]]]) -> List[List[str]]:
@@ -271,6 +275,181 @@ class RuleBasedModel(nn.Module):
             if suit and suit != "trump":
                 counts[suit] = counts.get(suit, 0) + 1
         return counts
+
+    def _build_unseen_rank_tracker(self, context: Dict[str, Any]) -> Dict[str, Dict[str, int]]:
+        tracker: Dict[str, Dict[str, int]] = {suit: {rank: CARD_DUPLICATES for rank in RANK_ORDER} for suit in ("s", "h", "c", "d")}
+        seen_cards: List[str] = []
+        seen_cards.extend(context.get("deck", []))
+        seen_cards.extend(context.get("played", []))
+        for move in context.get("history") or []:
+            seen_cards.extend(move)
+        level = context.get("level")
+        major = context.get("major")
+        for card in seen_cards:
+            if len(card) != 2:
+                continue
+            suit, rank = card[0], card[1]
+            if rank == level or suit == major:
+                continue
+            if suit in tracker and rank in tracker[suit]:
+                tracker[suit][rank] = max(0, tracker[suit][rank] - 1)
+        return tracker
+
+    def _option_top_rank(self, option: Dict[str, Any]) -> Optional[str]:
+        best: Optional[str] = None
+        for card in option.get("cards", []):
+            if len(card) != 2:
+                continue
+            rank = card[1]
+            if best is None or RANK_ORDER.get(rank, -1) > RANK_ORDER.get(best, -1):
+                best = rank
+        return best
+
+    def _option_dominance_score(self, option: Dict[str, Any], context: Dict[str, Any]) -> float:
+        suit = option.get("primary_suit")
+        if not suit or suit == "trump":
+            return 0.0
+        tracker = context.get("rank_tracker") or {}
+        suit_tracker = tracker.get(suit, {})
+        top_rank = self._option_top_rank(option)
+        if top_rank is None:
+            return 0.0
+        higher_remaining = sum(
+            count
+            for rank, count in suit_tracker.items()
+            if RANK_ORDER.get(rank, -1) > RANK_ORDER.get(top_rank, -1) and count > 0
+        )
+        dominance = 1.0 if higher_remaining == 0 else max(0.0, 0.6 - 0.2 * higher_remaining)
+        enemy_void = context.get("enemy_void_suits", set())
+        teammate_void = context.get("teammate_void_suits", set())
+        if enemy_void:
+            dominance -= 0.1
+        if suit in enemy_void:
+            dominance -= 0.8
+        if suit in teammate_void:
+            dominance += 0.3
+        return dominance
+
+    def _are_aces_cleared(self, suit: str, context: Dict[str, Any]) -> bool:
+        tracker = context.get("rank_tracker") or {}
+        return tracker.get(suit, {}).get("A", 0) == 0
+
+    def _can_release_high_points(self, option: Dict[str, Any], context: Dict[str, Any]) -> bool:
+        ranks = self._option_point_ranks(option)
+        if not ranks & {"K", "0"}:
+            return True
+        suit = option.get("primary_suit")
+        if not suit or suit == "trump":
+            return True
+        if context.get("enemy_void_suits"):
+            return False
+        return self._are_aces_cleared(suit, context)
+
+    def _filter_farmer_joker_usage(self, options: List[Dict[str, Any]], context: Dict[str, Any]) -> List[Dict[str, Any]]:
+        if not options:
+            return []
+        if context.get("role") != "farmer":
+            return options
+        if context.get("points_on_table", 0) > 20:
+            return options
+        filtered = [opt for opt in options if not self._contains_joker(opt)]
+        return filtered if filtered else options
+
+    def _opponent_trump_played(self, context: Dict[str, Any]) -> bool:
+        order = context.get("current_trick_order") or []
+        history = context.get("history") or []
+        teammate_id = context.get("teammate_id")
+        player_id = context.get("player_id")
+        major = context.get("major", "s")
+        level = context.get("level", "2")
+        for idx, move in enumerate(history):
+            if idx >= len(order):
+                continue
+            seat = order[idx]
+            if seat == player_id or seat == teammate_id:
+                continue
+            if any(self._is_trump(card, major, level) for card in move):
+                return True
+        return False
+
+    def _history_has_trump(self, history: List[List[str]], major: str, level: str) -> bool:
+        for move in history:
+            for card in move:
+                if self._is_trump(card, major, level):
+                    return True
+        return False
+
+    def _is_kill_play(self, option: Dict[str, Any], context: Dict[str, Any], current_best: Optional[Dict[str, Any]]) -> bool:
+        if not option.get("is_trump"):
+            return False
+        if self._seat_index(context) != 3:
+            return False
+        lead_suit = context.get("lead_suit")
+        if lead_suit == "trump":
+            return False
+        if current_best and current_best.get("is_trump"):
+            return False
+        history = context.get("history") or []
+        major = context.get("major", "s")
+        level = context.get("level", "2")
+        if self._history_has_trump(history, major, level):
+            return False
+        if self._opponent_trump_played(context):
+            return False
+        return True
+
+    def _kill_budget(self, context: Dict[str, Any]) -> int:
+        trump_count = context.get("hand_trump_count", 0)
+        role = context.get("role", "farmer")
+        if role == "farmer":
+            if trump_count > 12:
+                return 99
+            if 9 <= trump_count <= 12:
+                return trump_count - 9
+            return 0
+        # Banker side
+        return max(trump_count - 9, 0)
+
+    def _kill_resource_allowed(self, option: Dict[str, Any], context: Dict[str, Any], points_on_table: int) -> bool:
+        level = context.get("level", "2")
+        joker_count = context.get("joker_count", 0)
+        contains_level = self._option_contains_rank(option, level)
+        cards = option.get("cards", [])
+        contains_small = any(card == "jo" for card in cards)
+        contains_big = any(card == "Jo" for card in cards)
+        if contains_level and points_on_table < 10:
+            return False
+        if contains_small or contains_big:
+            if points_on_table > 10:
+                return True
+            if points_on_table == 10:
+                return joker_count > 1
+            return False
+        return True
+
+    def _kill_option_allowed(self, option: Dict[str, Any], context: Dict[str, Any]) -> bool:
+        points_on_table = context.get("points_on_table", 0)
+        force_kill = points_on_table >= 10
+        budget = self._kill_budget(context)
+        if not force_kill and budget <= 0:
+            return False
+        return self._kill_resource_allowed(option, context, points_on_table)
+
+    def _apply_kill_policy(
+        self,
+        candidates: List[Dict[str, Any]],
+        context: Dict[str, Any],
+        current_best: Optional[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not candidates:
+            return []
+        filtered: List[Dict[str, Any]] = []
+        for opt in candidates:
+            if self._is_kill_play(opt, context, current_best):
+                if not self._kill_option_allowed(opt, context):
+                    continue
+            filtered.append(opt)
+        return filtered
 
     def _card_strength(self, card: str, major: str, level: str) -> int:
         if card == "Jo":
@@ -407,6 +586,7 @@ class RuleBasedModel(nn.Module):
         seat_index = self._seat_index(context)
         points_on_table = context.get("points_on_table", 0)
         teammate_signal = context.get("teammate_small_trump_signal", False)
+        teammate_flags = context.get("teammate_flags", {})
 
         if (
             seat_index == 2
@@ -426,9 +606,21 @@ class RuleBasedModel(nn.Module):
             context["needs_reinforce_teammate"] = True
             return {"bucket": "control", "mode": "stage"}
         context["needs_aggressive_contest"] = not teammate_winning and seat_index == 1
+        suppress_farmer_trump = (
+            context.get("role") == "farmer"
+            and seat_index == 3
+            and points_on_table <= 20
+            and not teammate_winning
+        )
+        if suppress_farmer_trump and buckets.get("small"):
+            context["suppress_farmer_trump"] = True
+            return {"bucket": "small", "mode": "safety"}
         if not teammate_winning and buckets.get("control"):
             mode = "points" if points_on_table > 0 else "stage"
             return {"bucket": "control", "mode": mode}
+        if teammate_winning and teammate_flags.get("dumped_points") and buckets.get("small"):
+            context["protect_teammate_points"] = True
+            return {"bucket": "small", "mode": "safety"}
         if (
             not teammate_winning
             and seat_index == 1
@@ -503,6 +695,10 @@ class RuleBasedModel(nn.Module):
             low_cost = [opt for opt in candidates if opt.get("premium_cost", 0) < 15 and not self._contains_joker(opt)]
             if low_cost:
                 candidates = low_cost
+        candidates = self._filter_farmer_joker_usage(candidates, context) or candidates
+        candidates = self._apply_kill_policy(candidates, context, current_best)
+        if not candidates:
+            return []
         seat_index = self._seat_index(context)
         if seat_index == 3:
             return sorted(candidates, key=lambda opt: (opt.get("max_strength", 0), self._point_penalty(opt)))
@@ -706,7 +902,8 @@ class RuleBasedModel(nn.Module):
                 sequence = ["trump_control", "minimal_trump", "safe", "off_balance", "void", "points"]
             else:
                 sequence = ["off_balance", "safe", "void", "minimal_trump", "trump_control", "points"]
-            return self._prioritize_small_trump_pull(sequence, context)
+            sequence = self._prioritize_small_trump_pull(sequence, context)
+            return self._prioritize_teammate_void_support(sequence, context)
         if role == "banker":
             if state == "advantage":
                 if bias == "trump":
@@ -727,7 +924,8 @@ class RuleBasedModel(nn.Module):
                     sequence = ["off_balance", "void", "points", "safe", "trump_control", "minimal_trump"]
             else:
                 sequence = ["safe", "void", "off_balance", "minimal_trump", "points", "trump_control"]
-        return self._prioritize_small_trump_pull(sequence, context)
+        sequence = self._prioritize_small_trump_pull(sequence, context)
+        return self._prioritize_teammate_void_support(sequence, context)
 
     def _prioritize_small_trump_pull(self, sequence: List[str], context: Dict[str, Any]) -> List[str]:
         if not context.get("needs_small_trump_pull"):
@@ -739,6 +937,20 @@ class RuleBasedModel(nn.Module):
                 seq.insert(1, seq.pop(idx))
         else:
             seq.insert(1, "minimal_trump")
+        return seq
+
+    def _prioritize_teammate_void_support(self, sequence: List[str], context: Dict[str, Any]) -> List[str]:
+        flags = context.get("teammate_flags", {}) or {}
+        void_suit = flags.get("void_suit")
+        if not void_suit:
+            return sequence
+        if context.get("role") == "banker" and context.get("advantage_state") == "advantage":
+            return sequence
+        seq = list(sequence)
+        if "void" in seq:
+            idx = seq.index("void")
+            if idx > 1:
+                seq.insert(1, seq.pop(idx))
         return seq
 
     def _pick_lead_from_sequence(
@@ -824,6 +1036,7 @@ class RuleBasedModel(nn.Module):
                     ]
                 )
             filtered = prioritized if prioritized else candidates
+            filtered = [opt for opt in filtered if self._can_release_high_points(opt, context)] or filtered
         elif bucket_name in {"void", "safe"}:
             filtered = [opt for opt in candidates if not opt.get("contains_points")]
             filtered = filtered if filtered else candidates
@@ -882,7 +1095,7 @@ class RuleBasedModel(nn.Module):
         if bucket_name == "trump_control":
             return self._select_trump_lead(candidates)
         if bucket_name == "points":
-            return self._select_point_dump(candidates)
+            return self._select_point_lead_option(candidates, context)
         if bucket_name in {"safe", "void", "off_balance"}:
             return self._select_offensive_lead(bucket_name, candidates, context)
         if bucket_name == "minimal_trump":
@@ -945,7 +1158,19 @@ class RuleBasedModel(nn.Module):
         return best["index"]
 
     def _select_minimal(self, options: List[Dict[str, Any]]) -> int:
-        best = min(options, key=lambda opt: (self._point_penalty(opt), opt["max_strength"], opt["length"]))
+        def ranking(opt: Dict[str, Any]) -> Tuple[int, int, int, int]:
+            premium_penalty = opt.get("premium_cost", 0)
+            # Force premium trump resources to stay intact unless there is no alternative.
+            if opt.get("is_trump"):
+                premium_penalty += 40
+            return (
+                self._point_penalty(opt),
+                premium_penalty,
+                opt["max_strength"],
+                opt.get("length", 1),
+            )
+
+        best = min(options, key=ranking)
         return best["index"]
 
     def _select_smallest(self, options: List[Dict[str, Any]]) -> int:
@@ -955,6 +1180,28 @@ class RuleBasedModel(nn.Module):
         best = max(options, key=lambda opt: (opt["length"], opt["max_strength"] - opt["premium_cost"] - self._point_penalty(opt)))
         return best["index"]
 
+    def _select_point_lead_option(self, options: List[Dict[str, Any]], context: Dict[str, Any]) -> int:
+        if not options:
+            raise ValueError("_select_point_lead_option requires options")
+        filtered = [opt for opt in options if self._can_release_high_points(opt, context)]
+        candidates = filtered if filtered else options
+        suit_counts = context.get("hand_suit_counts", {})
+
+        def key(opt: Dict[str, Any]) -> Tuple[float, int, int, int, int]:
+            suit = opt.get("primary_suit")
+            dominance = self._option_dominance_score(opt, context)
+            suit_pressure = suit_counts.get(suit, 0)
+            return (
+                -dominance,
+                self._point_penalty(opt),
+                suit_pressure,
+                opt.get("premium_cost", 0),
+                -opt.get("max_strength", 0),
+            )
+
+        best = min(candidates, key=key)
+        return best["index"]
+
     def _select_offensive_lead(
         self,
         bucket_name: str,
@@ -962,24 +1209,32 @@ class RuleBasedModel(nn.Module):
         context: Dict[str, Any],
     ) -> int:
         suit_counts = context.get("hand_suit_counts", {})
-        if bucket_name == "off_balance":
-            best = max(options, key=lambda opt: (opt.get("max_strength", 0), opt.get("length", 1), -self._point_penalty(opt)))
-            return best["index"]
+        teammate_void = context.get("teammate_void_suits", set())
+        enemy_void = context.get("enemy_void_suits", set())
         if bucket_name == "void":
             strong = [opt for opt in options if opt.get("max_strength", 0) >= RANK_ORDER.get("9", 7)]
             if strong:
                 options = strong
-        def key(opt):
+
+        def key(opt: Dict[str, Any]) -> Tuple[float, int, int, float, float]:
             suit = opt.get("primary_suit")
+            dominance = self._option_dominance_score(opt, context)
             suit_pressure = suit_counts.get(suit, 0)
+            void_bias = 0.0
+            if bucket_name == "void" and suit in teammate_void:
+                void_bias -= 0.5
+            if suit in enemy_void:
+                void_bias += 0.5
+            risk = 1 if opt.get("contains_points") else 0
             return (
-                opt.get("max_strength", 0),
-                -suit_pressure,
-                -self._point_penalty(opt),
-                -opt.get("premium_cost", 0),
+                -(dominance - void_bias),
+                risk,
+                suit_pressure,
+                self._point_penalty(opt),
+                opt.get("premium_cost", 0) - opt.get("max_strength", 0),
             )
 
-        best = max(options, key=key)
+        best = min(options, key=key)
         return best["index"]
 
     def _select_minimum_point_dump(self, options: List[Dict[str, Any]]) -> int:
@@ -987,6 +1242,7 @@ class RuleBasedModel(nn.Module):
         return best["index"]
 
     def _select_low_risk_filler(self, options: List[Dict[str, Any]], context: Dict[str, Any]) -> int:
+        options = self._filter_farmer_joker_usage(options, context) or options
         bait = self._bait_point_traps(options, context)
         if bait:
             return self._select_smallest(bait)
@@ -995,7 +1251,13 @@ class RuleBasedModel(nn.Module):
             return self._select_smallest(void_ready)
         non_point = [opt for opt in options if not opt.get("contains_points")]
         if non_point:
+            low_premium = [opt for opt in non_point if opt.get("premium_cost", 0) <= 5]
+            if low_premium:
+                return self._select_smallest(low_premium)
             return self._select_smallest(non_point)
+        low_premium_any = [opt for opt in options if opt.get("premium_cost", 0) <= 5]
+        if low_premium_any:
+            return self._select_smallest(low_premium_any)
         five_only = [opt for opt in options if self._option_points_subset(opt, {"5"})]
         if five_only:
             return self._select_smallest(five_only)
@@ -1571,6 +1833,8 @@ class RuleBasedModel(nn.Module):
     def _should_preserve_big_trump(self, option: Dict[str, Any], context: Dict[str, Any]) -> bool:
         if not option.get("is_trump"):
             return False
+        if self._contains_joker(option) and context.get("role") == "farmer" and context.get("points_on_table", 0) <= 20:
+            return True
         max_strength = option.get("max_strength", 0)
         if max_strength < BIG_TRUMP_STRENGTH:
             return False
@@ -1610,8 +1874,38 @@ class RuleBasedModel(nn.Module):
     def _prepare_point_dump_candidates(self, options: List[Dict[str, Any]], context: Dict[str, Any]) -> List[Dict[str, Any]]:
         if not options:
             return []
-        candidates = [opt for opt in options if opt.get("contains_points") and not opt.get("is_trump")]
-        return candidates
+        stage = context.get("stage", "mid") if context else "mid"
+        allow_heavy_points = stage == "late" or bool(context.get("strong_peer_mark"))
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for opt in options:
+            if not opt.get("contains_points") or opt.get("is_trump"):
+                continue
+            suit = opt.get("primary_suit") or f"misc_{opt['index']}"
+            grouped.setdefault(suit, []).append(opt)
+
+        results: List[Dict[str, Any]] = []
+        per_suit_limit = 2 if allow_heavy_points else 1
+        for suit, suit_opts in grouped.items():
+            suit_opts.sort(
+                key=lambda opt: (
+                    self._point_penalty(opt),
+                    opt.get("premium_cost", 0),
+                    opt.get("max_strength", 0),
+                    opt.get("length", 1),
+                )
+            )
+            filtered: List[Dict[str, Any]] = []
+            for candidate in suit_opts:
+                ranks = self._option_point_ranks(candidate)
+                if not allow_heavy_points and {"0", "K"} & ranks and len(suit_opts) == 1:
+                    continue
+                if not self._can_release_high_points(candidate, context):
+                    continue
+                filtered.append(candidate)
+            if not filtered:
+                continue
+            results.extend(filtered[:per_suit_limit])
+        return results
 
     def _select_point_dump(self, options: List[Dict[str, Any]]) -> int:
         if not options:
