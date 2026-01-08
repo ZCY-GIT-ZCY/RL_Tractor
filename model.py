@@ -76,8 +76,6 @@ class CNNModelDeep(nn.Module):
         self._blocks = nn.Sequential(
             ResidualBlock(256),
             ResidualBlock(256),
-            ResidualBlock(256),
-            ResidualBlock(256),
         )
         self._tail = nn.Sequential(
             nn.Conv2d(256, 64, 3, 1, 1, bias=False),
