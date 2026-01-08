@@ -16,16 +16,22 @@ if __name__ == '__main__':
         'gamma': 0.99,  # discount factor
         'lambda': 0.95,  # GAE lambda
         'min_sample': 10000,   # min samples before learner starts
-        'batch_size': 128,   # batch size for learner
+        'batch_size': 2048,   # batch size for learner
         'epochs': 3,  # number of epochs per update
         'clip': 0.2,   # PPO clip parameter
         'lr': 1e-4, # learning rate
         'value_coeff': 1,   # value loss coefficient
         'entropy_coeff': 0.01,  # entropy loss coefficient
         'device': 'cuda',  # device to run the model on
-        'ckpt_save_interval': 1800,  # checkpoint save interval in seconds
+        'ckpt_save_interval': 600,  # checkpoint save interval in seconds
         'ckpt_save_path': 'checkpoint/',  # checkpoint save path
         'init_model_path': 'Pre_trained_Data/init_model.pt',  # optional initial weights
+        'rl_team': 0,  # 0 => players 0/2 are RL; 1 => players 1/3 are RL
+        'eval_enable': True,
+        'eval_games': 300,
+        'eval_plot_name': 'eval_winrate.png',
+        'warmup_iterations': 500,  # value-only warmup iterations
+        'warmup_value_coeff': 1.0,
         # Global progress totals
         'learner_iterations': 100000,  # total learner iterations before stopping
         'normalize_adv': True,

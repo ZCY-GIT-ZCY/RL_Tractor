@@ -1,4 +1,4 @@
-from multiprocessing import Process
+from multiprocessing import Process, Queue
 import time
 import numpy as np
 import torch
@@ -8,6 +8,7 @@ from torch.nn import functional as F
 from replay_buffer import ReplayBuffer
 from model_pool import ModelPoolServer
 from model import CNNModel
+from evaluation import EvaluationWorker, EvalTask
 
 class Learner(Process):
     
@@ -19,8 +20,15 @@ class Learner(Process):
         self._iter_counter = config.get('learner_iter_counter')
         self._done_event = config.get('learner_done_event')
         self._stop_event = config.get('stop_event')
+        self._eval_worker = None
+        self._eval_queue = None
     
     def run(self):
+        # start evaluation worker if enabled
+        if self.config.get('eval_enable', False):
+            self._eval_queue = Queue(maxsize=4)
+            self._eval_worker = EvaluationWorker(self._eval_queue, self.config)
+            self._eval_worker.start()
         # create model pool
         model_pool = ModelPoolServer(self.config['model_pool_size'], self.config['model_pool_name'])
         
@@ -66,6 +74,7 @@ class Learner(Process):
             actions = torch.tensor(batch['action']).unsqueeze(-1).to(device)
             advs = torch.tensor(batch['adv']).to(device)
             targets = torch.tensor(batch['target']).to(device)
+            logp_old = torch.tensor(batch['logp_old']).unsqueeze(-1).to(device)
 
             if self.config.get('normalize_adv', False):
                 adv_mean = advs.mean()
@@ -77,17 +86,18 @@ class Learner(Process):
             
             # calculate PPO loss
             model.train(True) # Batch Norm training mode
-            old_logits, _ = model(states)
-            if not torch.isfinite(old_logits).all():
-                print("[Learner] Non-finite logits detected before update, aborting training cycle.")
-                stop_reason = "non_finite_old_logits"
+            if not torch.isfinite(logp_old).all():
+                print("[Learner] Non-finite behavior log-probs detected, aborting training cycle.")
+                stop_reason = "non_finite_logp_old"
                 break
-            old_log_probs = F.log_softmax(old_logits, dim=1).gather(1, actions).detach()
             last_policy_loss = None
             last_value_loss = None
             last_entropy_loss = None
             last_total_loss = None
             invalid_update = False
+            warmup_iters = int(self.config.get('warmup_iterations', 0))
+            warmup_active = warmup_iters > 0 and iterations < warmup_iters
+            warmup_value_coeff = float(self.config.get('warmup_value_coeff', self.config['value_coeff']))
             for _ in range(self.config['epochs']):
                 logits, values = model(states)
                 if (not torch.isfinite(logits).all()) or (not torch.isfinite(values).all()):
@@ -95,16 +105,22 @@ class Learner(Process):
                     stop_reason = "non_finite_update"
                     invalid_update = True
                     break
-                action_dist = torch.distributions.Categorical(logits=logits)
-                log_probs = F.log_softmax(logits, dim=1).gather(1, actions)
-                log_ratio = (log_probs - old_log_probs).clamp(-20, 20)
-                ratio = torch.exp(log_ratio)
-                surr1 = ratio * advs
-                surr2 = torch.clamp(ratio, 1 - self.config['clip'], 1 + self.config['clip']) * advs
-                policy_loss = -torch.mean(torch.min(surr1, surr2))
                 value_loss = torch.mean(F.mse_loss(values.squeeze(-1), targets))
-                entropy_loss = -torch.mean(action_dist.entropy())
-                loss = policy_loss + self.config['value_coeff'] * value_loss + self.config['entropy_coeff'] * entropy_loss
+                if warmup_active:
+                    policy_loss = torch.tensor(0.0, device=value_loss.device)
+                    entropy_loss = torch.tensor(0.0, device=value_loss.device)
+                    loss = warmup_value_coeff * value_loss
+                else:
+                    masked_logits = logits.masked_fill(mask <= 0, -1e9)
+                    action_dist = torch.distributions.Categorical(logits=masked_logits)
+                    log_probs = F.log_softmax(masked_logits, dim=1).gather(1, actions)
+                    log_ratio = (log_probs - logp_old).clamp(-20, 20)
+                    ratio = torch.exp(log_ratio)
+                    surr1 = ratio * advs
+                    surr2 = torch.clamp(ratio, 1 - self.config['clip'], 1 + self.config['clip']) * advs
+                    policy_loss = -torch.mean(torch.min(surr1, surr2))
+                    entropy_loss = -torch.mean(action_dist.entropy())
+                    loss = policy_loss + self.config['value_coeff'] * value_loss + self.config['entropy_coeff'] * entropy_loss
                 optimizer.zero_grad()
                 loss.backward()
                 max_grad_norm = self.config.get('max_grad_norm', 0)
@@ -133,6 +149,11 @@ class Learner(Process):
                 torch.save(model.state_dict(), path)
                 cur_time = t
                 # checkpoint saved
+                if self._eval_queue is not None:
+                    try:
+                        self._eval_queue.put_nowait(EvalTask(iterations=iterations, checkpoint_path=path))
+                    except Exception:
+                        pass
             iterations += 1
             # Update shared counter
             if self._iter_counter is not None:
@@ -155,6 +176,19 @@ class Learner(Process):
         final_path = os.path.join(ckpt_dir, f"model_final_iter{iterations}.pt")
         torch.save(model_cpu.state_dict(), final_path)
         print(f"[Learner] Saved final model to {final_path} (reason={stop_reason})")
+
+        if self._eval_queue is not None:
+            try:
+                self._eval_queue.put_nowait(EvalTask(iterations=iterations, checkpoint_path=final_path))
+            except Exception:
+                pass
+        if self._eval_worker is not None:
+            try:
+                if self._eval_queue is not None:
+                    self._eval_queue.put_nowait(None)
+            except Exception:
+                pass
+            self._eval_worker.join(timeout=5.0)
 
         if self._stop_event is not None:
             try:

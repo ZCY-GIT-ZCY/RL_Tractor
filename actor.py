@@ -7,6 +7,7 @@ from replay_buffer import ReplayBuffer
 from model_pool import ModelPoolClient
 from env import TractorEnv
 from model import CNNModel
+from rule_based_model import RuleBasedModel
 
 from wrapper import cardWrapper
 from declaration import decide_declaration, decide_overcall
@@ -20,6 +21,7 @@ class Actor(Process):
         self.config = config
         self.auto_snatch_on_level = config.get('auto_snatch_on_level', True)
         self.name = config.get('name', 'Actor-?')
+        self.rl_team = int(config.get('rl_team', 0)) % 2
         # Shared progress counter (Value)
         self._episode_counter = config.get('actor_episode_counter')
         self._episodes_total = int(config.get('episodes_total', 0))
@@ -33,26 +35,36 @@ class Actor(Process):
         
         # create network model
         model = CNNModel()
+        rule_model = RuleBasedModel().eval()
         
         # load initial model
-        version = model_pool.get_latest_model()
-        state_dict = model_pool.load_model(version)
+        version = None
+        state_dict = None
+        while version is None or state_dict is None:
+            version = model_pool.get_latest_model()
+            if version is None:
+                continue
+            state_dict = model_pool.load_model(version)
+            if state_dict is None:
+                version = None
         model.load_state_dict(state_dict)
         
         # collect data
         env = TractorEnv()
         self.wrapper = cardWrapper()
-        policies = {player : model for player in env.agent_names} # all four players use the latest model
+        rl_player_ids = {pid for pid in range(4) if (pid % 2) == self.rl_team}
+        rl_agent_names = {env.agent_names[pid] for pid in rl_player_ids}
         
         for episode in range(self.config['episodes_per_actor']):
             if self._stop_event is not None and self._stop_event.is_set():
                 break
             # update model
             latest = model_pool.get_latest_model()
-            if latest['id'] > version['id']:
+            if latest is not None and version is not None and latest['id'] > version['id']:
                 state_dict = model_pool.load_model(latest)
-                model.load_state_dict(state_dict)
-                version = latest
+                if state_dict is not None:
+                    model.load_state_dict(state_dict)
+                    version = latest
             
             # run one episode and collect data
             obs, action_options = env.reset(major='r')
@@ -63,8 +75,9 @@ class Actor(Process):
                 },
                 'action' : [],
                 'reward' : [],
-                'value' : []
-            } for agent_name in env.agent_names}
+                'value' : [],
+                'logp_old': []
+            } for agent_name in rl_agent_names}
             done = False
             step_count = 0
             last_rewards = {}
@@ -74,7 +87,7 @@ class Actor(Process):
                 stage = obs.get('stage', TractorEnv.STAGE_PLAY)
                 player = obs['id']
                 agent_name = env.agent_names[player]
-                agent_data = episode_data[agent_name]
+                agent_data = episode_data.get(agent_name)
 
                 # handle declaration / kitty stages via rule-based heuristics
                 if stage == TractorEnv.STAGE_SNATCH:
@@ -93,30 +106,41 @@ class Actor(Process):
                 state = {}
                 obs_mat, action_mask = self.wrapper.obsWrap(obs, action_options)
 
-                agent_data['state']['observation'].append(obs_mat)
-                agent_data['state']['action_mask'].append(action_mask)
-
                 state['observation'] = torch.tensor(obs_mat, dtype = torch.float).unsqueeze(0)
                 state['action_mask'] = torch.tensor(action_mask, dtype = torch.float).unsqueeze(0)
+                mask_tensor = state['action_mask'].squeeze(0)
 
-                model.train(False) # Batch Norm inference mode
-                with torch.no_grad():
-                    logits, value = model(state)
-                    logits = logits.squeeze(0)
-                    mask_tensor = state['action_mask'].squeeze(0)
-                    valid_indices = torch.nonzero(mask_tensor > 0, as_tuple=False).squeeze(-1)
-                    if valid_indices.numel() == 0:
-                        action = 0
-                    else:
-                        valid_logits = logits[valid_indices]
-                        action_dist = torch.distributions.Categorical(logits=valid_logits)
-                        sampled = action_dist.sample()
-                        action = valid_indices[sampled].item()
-                    value = value.item()
+                is_rl_player = player in rl_player_ids
+                if is_rl_player and agent_data is not None:
+                    agent_data['state']['observation'].append(obs_mat)
+                    agent_data['state']['action_mask'].append(action_mask)
 
-                agent_data['action'].append(action)
-                agent_data['value'].append(value)
-                agent_data['reward'].append(0) # Initialize reward for this step
+                    model.train(False) # Batch Norm inference mode
+                    with torch.no_grad():
+                        logits, value = model(state)
+                        logits = logits.squeeze(0)
+                        valid_indices = torch.nonzero(mask_tensor > 0, as_tuple=False).squeeze(-1)
+                        if valid_indices.numel() == 0:
+                            action = 0
+                            logp_old = 0.0
+                        else:
+                            masked_logits = logits.masked_fill(mask_tensor <= 0, -1e9)
+                            action_dist = torch.distributions.Categorical(logits=masked_logits)
+                            action = int(action_dist.sample().item())
+                            logp_old = float(action_dist.log_prob(torch.tensor(action, dtype=torch.long)).item())
+                        value = float(value.item())
+
+                    agent_data['action'].append(action)
+                    agent_data['value'].append(value)
+                    agent_data['logp_old'].append(logp_old)
+                    agent_data['reward'].append(0) # Initialize reward for this step
+                else:
+                    rule_model.eval()
+                    with torch.no_grad():
+                        logits, _ = rule_model(state)
+                        logits = logits.squeeze(0)
+                        masked_logits = logits.masked_fill(mask_tensor <= 0, -1e9)
+                        action = int(torch.argmax(masked_logits).item())
 
                 response = {'player': player, 'action': action}
 
@@ -124,9 +148,9 @@ class Actor(Process):
                 next_obs, action_options, rewards, done = env.step(response)
                 if rewards:
                     # rewards are added per four moves (1 move for each player) on all four players
-                    for agent_name in rewards: 
+                    for agent_name in rewards:
                         # Add to the last reward entry (credit assignment)
-                        if len(episode_data[agent_name]['reward']) > 0:
+                        if agent_name in episode_data and len(episode_data[agent_name]['reward']) > 0:
                             episode_data[agent_name]['reward'][-1] += rewards[agent_name]
                     last_rewards = rewards
                 obs = next_obs
@@ -154,6 +178,7 @@ class Actor(Process):
                 actions = np.array(agent_data['action'][:length], dtype = np.int64)
                 rewards = np.array(agent_data['reward'][:length], dtype = np.float32)
                 values = np.array(agent_data['value'][:length], dtype = np.float32)
+                logp_old = np.array(agent_data['logp_old'][:length], dtype = np.float32)
                 # Next value estimation
                 # If done, next value is 0. If truncated, use bootstrap? Assuming done at episode end.
                 next_values = np.array(agent_data['value'][1:length+1] + [0], dtype = np.float32)
@@ -180,7 +205,8 @@ class Actor(Process):
                     },
                     'action': actions,
                     'adv': advantages,
-                    'target': td_target
+                    'target': td_target,
+                    'logp_old': logp_old
                 })
 
     def _select_declaration_action(self, env: TractorEnv, obs, action_options):
