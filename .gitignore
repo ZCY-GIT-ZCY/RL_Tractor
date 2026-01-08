@@ -1,0 +1,53 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.pyre/
+
+# ---- Virtual environments ----
+.venv/
+venv/
+ENV/
+env/
+
+# ---- IDE / OS ----
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ---- Logs / temp ----
+*.log
+*.tmp
+*.temp
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+
+# ---- ML / training artifacts (Tractor_Project) ----
+# model checkpoints / weights
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# dataset exports / numpy
+*.npz
+*.npy
+
+# large data folders produced locally
+berkley_rl_checkpoint/
+berkley_supervised_checkpoint/
+rule_base_RL_checkpoint/
+rule-base_supervised_checkpoint/
+Pre_trained_Data/
+data/
+
+# ---- Local simulation outputs (if any) ----n
+# add your local output dirs/files here

@@ -449,7 +449,7 @@ class TractorEnv():
             if p[1] == "5": publicscore += 5
             elif p[1] == "0" or p[1] == "K": publicscore += 10
         
-        self._reward(publicscore*mult, winner)        
+        self._reward(winner, publicscore*mult)
     
     def _setMajor(self):
         self.point_order = ['2', '3', '4', '5', '6', '7', '8', '9', '0', 'J', 'Q', 'K', 'A']
