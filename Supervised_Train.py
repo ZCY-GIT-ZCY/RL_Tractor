@@ -1,4 +1,4 @@
-from model import CNNModel
+from model import build_model, CNNModel, CNNModelDeep
 import torch
 from torch import nn, optim
 import numpy as np
@@ -13,6 +13,7 @@ VERBOSE_BATCH = 100
 SAVE_FREQ_EPOCH = 2
 # SAVE_PATH = "check_points/"
 SAVE_PATH = "rule-base_checkpoint/"
+MODEL_NAME = os.environ.get("MODEL_NAME", "base")
 
 # SPLIT_DIR = f"Pre_trained_Data/splitted_npy"
 SPLIT_DIR = "Pre_trained_Data/rule_base_npy"
@@ -113,8 +114,8 @@ if __name__ == '__main__':
         prefetch_factor=4,
     )
 
-    model = CNNModel().to(DEVICE)
-    optimizer = optim.AdamW(model.parameters(), lr=3e-5, weight_decay=8e-3)
+    model = build_model(MODEL_NAME).to(DEVICE)
+    optimizer = optim.AdamW(model.parameters(), lr=3e-5, weight_decay=2e-2)
     # 简单 warmup + cosine 调度：前 5 个 epoch 线性升至目标 lr，然后余弦衰减
     WARMUP_EPOCHS = 5
     TOTAL_EPOCHS = MAX_EPOCHS

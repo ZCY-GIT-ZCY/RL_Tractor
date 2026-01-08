@@ -1,6 +1,22 @@
 import torch
 from torch import nn
 
+
+class ResidualBlock(nn.Module):
+
+    def __init__(self, channels):
+        super().__init__()
+        self._net = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, 1, 1, bias=False),
+            nn.ReLU(True),
+            nn.Conv2d(channels, channels, 3, 1, 1, bias=False),
+        )
+        self._act = nn.ReLU(True)
+
+    def forward(self, x):
+        out = self._net(x)
+        return self._act(out + x)
+
 class CNNModel(nn.Module):
 
     def __init__(self):
@@ -45,3 +61,67 @@ class CNNModel(nn.Module):
         # assert torch.isfinite(masked_logits).all(), masked_logits.min()
         value = self._value_branch(hidden)
         return masked_logits, value
+
+
+class CNNModelDeep(nn.Module):
+
+    def __init__(self):
+        nn.Module.__init__(self)
+        self._stem = nn.Sequential(
+            nn.Conv2d(128, 256, 3, 1, 1, bias=False),
+            nn.ReLU(True),
+            nn.Conv2d(256, 256, 3, 1, 1, bias=False),
+            nn.ReLU(True),
+        )
+        self._blocks = nn.Sequential(
+            ResidualBlock(256),
+            ResidualBlock(256),
+            ResidualBlock(256),
+            ResidualBlock(256),
+        )
+        self._tail = nn.Sequential(
+            nn.Conv2d(256, 64, 3, 1, 1, bias=False),
+            nn.ReLU(True),
+            nn.Flatten()
+        )
+        self._logits = nn.Sequential(
+            nn.Linear(64 * 4 * 14, 512),
+            nn.ReLU(True),
+            nn.Dropout(0.2),
+            nn.Linear(512, 256),
+            nn.ReLU(True),
+            nn.Dropout(0.2),
+            nn.Linear(256, 54)
+        )
+        self._value_branch = nn.Sequential(
+            nn.Linear(64 * 4 * 14, 512),
+            nn.ReLU(True),
+            nn.Dropout(0.2),
+            nn.Linear(512, 256),
+            nn.ReLU(True),
+            nn.Dropout(0.2),
+            nn.Linear(256, 1)
+        )
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight)
+
+    def forward(self, input_dict):
+        obs = input_dict["observation"].float()
+        mask = input_dict["action_mask"].float()
+        hidden = self._tail(self._blocks(self._stem(obs)))
+        logits = self._logits(hidden).float()
+        invalid = mask <= 0
+        masked_logits = logits.masked_fill(invalid, -100)
+        value = self._value_branch(hidden)
+        return masked_logits, value
+
+
+def build_model(name="base"):
+    if name is None:
+        return CNNModel()
+    name = str(name).lower().strip()
+    if name in ("deep", "cnn_deep", "cnnmodeldeep"):
+        return CNNModelDeep()
+    return CNNModel()
