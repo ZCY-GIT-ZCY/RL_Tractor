@@ -87,19 +87,17 @@ class CNNModelDeep(nn.Module):
         self._logits = nn.Sequential(
             nn.Linear(64 * 4 * 14, 512),
             nn.ReLU(True),
-            nn.Dropout(0.2),
+            nn.Dropout(0.1),
             nn.Linear(512, 256),
             nn.ReLU(True),
-            nn.Dropout(0.2),
+            nn.Dropout(0.1),
             nn.Linear(256, 54)
         )
         self._value_branch = nn.Sequential(
             nn.Linear(64 * 4 * 14, 512),
             nn.ReLU(True),
-            nn.Dropout(0.2),
             nn.Linear(512, 256),
             nn.ReLU(True),
-            nn.Dropout(0.2),
             nn.Linear(256, 1)
         )
 

@@ -115,7 +115,7 @@ if __name__ == '__main__':
     )
 
     model = build_model(MODEL_NAME).to(DEVICE)
-    optimizer = optim.AdamW(model.parameters(), lr=3e-5, weight_decay=2e-2)
+    optimizer = optim.AdamW(model.parameters(), lr=3e-5, weight_decay=1e-2)
     # 简单 warmup + cosine 调度：前 5 个 epoch 线性升至目标 lr，然后余弦衰减
     WARMUP_EPOCHS = 5
     TOTAL_EPOCHS = MAX_EPOCHS
