@@ -70,6 +70,8 @@ def _find_option_index(action_options: List[List[str]], target_cards: List[str])
     return None
 
 
+
+
 class AlwaysPassPolicy:
     def select_action(self, env: TractorEnv, obs: Dict[str, Any], action_options: List[List[str]]) -> int:
         return 0
@@ -188,6 +190,15 @@ class CliPrinter:
         print(self._format_player_hand(event.player, event.player_hand))
         print("")
 
+    def print_play_options(self, player: int, chosen: List[str], options: List[List[str]], max_show: int) -> None:
+        print(f"[出牌选项] P{player} chosen={list(chosen)} total_options={len(options)}")
+        if max_show > 0:
+            for idx, opt in enumerate(options[:max_show]):
+                print(f"  opt[{idx}]: {opt}")
+            if len(options) > max_show:
+                print(f"  ... {len(options) - max_show} more")
+        print("")
+
     def print_round_hands(self, hands: List[List[str]]) -> None:
         print("[本轮截止] 四人手牌：")
         for pid, hand in enumerate(hands):
@@ -293,6 +304,7 @@ class LocalSimulator:
                 pass
 
         self.printer = CliPrinter(show_sorted_hand=bool(self.config.get("show_sorted_hand", True)))
+        self.log_play_only = bool(self.config.get("log_play_only", False))
 
         # 随机决定“级牌 sequence”；本文件只用到第一张 level
         self.level_sequence = list(self.config.get("level_sequence") or _default_level_sequence(self.rng))
@@ -309,6 +321,8 @@ class LocalSimulator:
         if total_rounds != 100:
             # env 固定 card_todeal=100；这里允许你以后扩展，但当前先强制一致
             raise ValueError("TractorEnv 当前实现固定摸牌 100 轮，请把 deal_rounds 设为 100")
+        if self.config.get("log_options"):
+            print(f"[debug] log_options enabled, max_option_log={int(self.config.get('max_option_log', 10) or 0)}")
 
         banker_pos = self._pick_banker_pos()
         level = self.level_sequence[0]
@@ -337,31 +351,41 @@ class LocalSimulator:
             player = int(obs["id"])
             dealt_card_name = self._latest_dealt_card_name(player)
 
-            self.printer.print_round_header(round_idx, total_rounds)
+            if not self.log_play_only:
+                self.printer.print_round_header(round_idx, total_rounds)
 
             # 事件 1：摸牌
-            self.printer.print_event(
-                Event(
-                    name="摸牌",
-                    content=f"get={dealt_card_name}",
-                    player=player,
-                    player_hand=_hand_names(self.env, player),
+            if not self.log_play_only:
+                self.printer.print_event(
+                    Event(
+                        name="摸牌",
+                        content=f"get={dealt_card_name}",
+                        player=player,
+                        player_hand=_hand_names(self.env, player),
+                    )
                 )
-            )
 
             # 事件 2：报主/反主/不报
             action_idx = self.policies[player].select_action(self.env, obs, action_options)
             action_idx = max(0, min(int(action_idx), max(0, len(action_options) - 1)))
             chosen = (action_options[action_idx] if action_options else [])
-            evt_name, evt_content = self._format_snatch_event(chosen)
-            self.printer.print_event(
-                Event(
-                    name=evt_name,
-                    content=evt_content,
-                    player=player,
-                    player_hand=_hand_names(self.env, player),
+            if self.config.get("log_options"):
+                self.printer.print_play_options(
+                    player,
+                    list(chosen),
+                    action_options or [],
+                    int(self.config.get("max_option_log", 10) or 0),
                 )
-            )
+            if not self.log_play_only:
+                evt_name, evt_content = self._format_snatch_event(chosen)
+                self.printer.print_event(
+                    Event(
+                        name=evt_name,
+                        content=evt_content,
+                        player=player,
+                        player_hand=_hand_names(self.env, player),
+                    )
+                )
 
             # 注意：env.step() 在 SNATCH 阶段会“先处理本玩家报主/反主”，
             # 然后立刻给下家发下一张牌。
@@ -373,7 +397,8 @@ class LocalSimulator:
             obs, action_options, _, _ = self.env.step({"player": player, "action": action_idx})
 
             # 本轮截止：四人手牌
-            self.printer.print_round_hands(hands_snapshot)
+            if not self.log_play_only:
+                self.printer.print_round_hands(hands_snapshot)
 
             if round_idx >= total_rounds:
                 break
@@ -392,15 +417,17 @@ class LocalSimulator:
                 bury_total = int(getattr(self.env, "bury_left", 0) or 0)
                 bury_total = max(bury_total, 1)
                 public_cards = [self.env._id2name(cid) for cid in getattr(self.env, "card_public", [])]
-                self.printer.print_event(
-                    Event(
-                        name="底牌入庄",
-                        content=f"public={public_cards} (now banker_hand={len(self.env.player_decks[banker])})",
-                        player=banker,
-                        player_hand=_hand_names(self.env, banker),
+                if not self.log_play_only:
+                    self.printer.print_event(
+                        Event(
+                            name="底牌入庄",
+                            content=f"public={public_cards} (now banker_hand={len(self.env.player_decks[banker])})",
+                            player=banker,
+                            player_hand=_hand_names(self.env, banker),
+                        )
                     )
-                )
-            self.printer.print_bury_header(bury_step, bury_total, banker)
+            if not self.log_play_only:
+                self.printer.print_bury_header(bury_step, bury_total, banker)
 
             action_idx = 0
             if isinstance(self.bury_policy, BuryPolicy):
@@ -411,15 +438,16 @@ class LocalSimulator:
 
             obs, action_options, _, _ = self.env.step({"player": banker, "action": action_idx})
 
-            self.printer.print_event(
-                Event(
-                    name="扣底",
-                    content=f"bury={list(chosen)} bury_left_before={bury_left_before}",
-                    player=banker,
-                    player_hand=_hand_names(self.env, banker),
+            if not self.log_play_only:
+                self.printer.print_event(
+                    Event(
+                        name="扣底",
+                        content=f"bury={list(chosen)} bury_left_before={bury_left_before}",
+                        player=banker,
+                        player_hand=_hand_names(self.env, banker),
+                    )
                 )
-            )
-            self.printer.print_round_hands(_all_hands(self.env))
+                self.printer.print_round_hands(_all_hands(self.env))
             bury_step += 1
 
         # ---------- STAGE_PLAY：出牌直到结束 ----------
@@ -454,6 +482,13 @@ class LocalSimulator:
                 action_idx = self.play_policy.select_play_action(self.env, obs, action_options)
             action_idx = max(0, min(int(action_idx), max(0, len(action_options) - 1)))
             chosen = (action_options[action_idx] if action_options else [])
+            if self.config.get("log_options"):
+                self.printer.print_play_options(
+                    player,
+                    list(chosen),
+                    action_options or [],
+                    int(self.config.get("max_option_log", 10) or 0),
+                )
 
             before_score = int(getattr(self.env, "score", 0) or 0)
             before_history_len = len(getattr(self.env, "history", []))
@@ -485,7 +520,8 @@ class LocalSimulator:
                         player_hand=_hand_names(self.env, winner if winner >= 0 else player),
                     )
                 )
-                self.printer.print_round_hands(_all_hands(self.env))
+                if not self.log_play_only:
+                    self.printer.print_round_hands(_all_hands(self.env))
 
             if done:
                 final_score = int(getattr(self.env, "score", 0) or 0)
@@ -497,7 +533,8 @@ class LocalSimulator:
                         player_hand=_hand_names(self.env, int(getattr(self.env, "curr_player", 0))),
                     )
                 )
-                self.printer.print_round_hands(_all_hands(self.env))
+                if not self.log_play_only:
+                    self.printer.print_round_hands(_all_hands(self.env))
                 break
 
     def _pick_banker_pos(self) -> int:
@@ -538,6 +575,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # 扣底与出牌的默认策略（全局）。
     "bury": {"type": "kitty"},
     "play": {"type": "rule_based"},
+    "log_options": False,
+    "max_option_log": 10,
+    "log_play_only": False,
 }
 
 
@@ -546,6 +586,9 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=None, help="Random seed (optional).")
     parser.add_argument("--banker", type=str, default="random", help="Banker seat: 0/1/2/3 or 'random'.")
     parser.add_argument("--level", type=str, default=None, help="Force level for this game (e.g. '2','A','0','J').")
+    parser.add_argument("--log-options", action="store_true", help="Log play action options for debugging.")
+    parser.add_argument("--max-option-log", type=int, default=10, help="Max number of play options to print per move.")
+    parser.add_argument("--log-play-only", action="store_true", help="Only log play-stage events.")
     args = parser.parse_args()
 
     cfg = dict(DEFAULT_CONFIG)
@@ -556,6 +599,11 @@ def main() -> None:
         if args.level not in LEVELS:
             raise ValueError(f"Invalid level: {args.level!r}, must be one of {LEVELS}")
         cfg["level_sequence"] = [args.level] + [lv for lv in LEVELS if lv != args.level]
+    if args.log_options:
+        cfg["log_options"] = True
+        cfg["max_option_log"] = int(args.max_option_log)
+    if args.log_play_only:
+        cfg["log_play_only"] = True
 
     sim = LocalSimulator(cfg)
     sim.run_one_game()
